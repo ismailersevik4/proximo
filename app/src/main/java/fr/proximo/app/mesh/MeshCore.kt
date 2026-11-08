@@ -187,7 +187,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             val fwd = f.forwarded()
             val o = Outbox(fid, fwd.encode(), fwd.toHex, now, mutableSetOf(fromPeer, f.fromHex), mine = false)
             lock.withLock { db.saveOutbox(o) }
-            flush()
+            scope.launch { flush() } // hors du fil de réception : il relit la file (parfois des Mo) et ne doit pas retarder les trames suivantes
         }
     }
 
