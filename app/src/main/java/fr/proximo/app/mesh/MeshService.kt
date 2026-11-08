@@ -131,7 +131,7 @@ class MeshService : Service() {
             .setContentTitle("Proximo" + if (nb > 0) " · réseau actif" else "")
             .setContentText(text)
             .setContentIntent(pi)
-            .setOngoing(true)
+            .setOngoing(false) // balayable (Android 13+) : le service continue quand même
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setSilent(true)
             .build()
