@@ -196,6 +196,12 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         return out
     }
     fun outboxCount(): Int = q("SELECT COUNT(*) FROM outbox") { it.getInt(0) }.firstOrNull() ?: 0
+    /** (mes messages en attente, trames en transit pour d'autres). Les trames techniques (accusés, contacts) ne comptent pas. */
+    fun outboxDetail(): Pair<Int, Int> {
+        val mine = q("SELECT COUNT(*) FROM outbox WHERE mine=1") { it.getInt(0) }.firstOrNull() ?: 0
+        val others = q("SELECT COUNT(*) FROM outbox WHERE mine=0") { it.getInt(0) }.firstOrNull() ?: 0
+        return mine to others
+    }
     fun saveOutbox(o: Outbox) {
         java.io.File(outboxDir, o.fid + ".bin").writeBytes(o.data)
         val cv = ContentValues().apply {

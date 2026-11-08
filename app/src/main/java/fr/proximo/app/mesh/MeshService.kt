@@ -73,7 +73,7 @@ class MeshService : Service() {
         running.value = this
         // Notification vivante : nombre de téléphones à portée et messages en attente.
         scope.launch {
-            kotlinx.coroutines.flow.combine(core.peers, core.pendingCount) { p, n -> p.size to n }
+            kotlinx.coroutines.flow.combine(core.peers, core.pendingDetail) { p, d -> p.size to d.first }
                 .debounce(1500)
                 .collect { (nb, pending) -> try { getSystemService(NotificationManager::class.java).notify(NOTIF_ID, serviceNotification(nb, pending)) } catch (_: Exception) {} }
         }
@@ -124,8 +124,8 @@ class MeshService : Service() {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val text = when {
             nb < 0 -> getString(R.string.notif_running)
-            nb == 0 -> "Personne à portée pour l'instant" + if (pending > 0) " · $pending message(s) en attente" else ""
-            else -> "$nb téléphone${if (nb > 1) "s" else ""} à portée" + if (pending > 0) " · $pending message(s) en attente" else ""
+            nb == 0 -> "Personne à portée pour l'instant" + if (pending > 0) " · $pending de tes messages en attente" else ""
+            else -> "$nb téléphone${if (nb > 1) "s" else ""} à portée" + if (pending > 0) " · $pending de tes messages en attente" else ""
         }
         return NotificationCompat.Builder(this, CH_SERVICE)
             .setSmallIcon(R.drawable.ic_notif)

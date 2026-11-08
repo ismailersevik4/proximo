@@ -49,11 +49,15 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     private val rx = Dispatchers.IO.limitedParallelism(1)
     private val lock = Mutex()
     private val recentSeen = ConcurrentHashMap<String, Long>()
+    /** Heure du dernier envoi direct au destinataire d'un de mes messages (pour renvoyer si pas d'accusé). */
+    private val lastDirectSend = ConcurrentHashMap<String, Long>()
 
     private val peerMap = ConcurrentHashMap<String, Peer>()
     val peers = MutableStateFlow<List<Peer>>(emptyList())
     val status = MutableStateFlow<Map<String, TransportStatus>>(emptyMap())
     val pendingCount = MutableStateFlow(0)
+    /** (mes messages en attente, messages en transit pour d'autres). */
+    val pendingDetail = MutableStateFlow(0 to 0)
 
     /** Celui qui reçoit ce qui m'est destiné (la messagerie). Rend true si la trame a été traitée. */
     var handler: ((Frame, String) -> Boolean)? = null
@@ -161,7 +165,13 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         if (f.fromHex == me.id) return
         val now = System.currentTimeMillis()
         if (f.relayable && !replay) {
-            if (recentSeen.containsKey(fid) || db.seen(fid)) return
+            if (recentSeen.containsKey(fid) || db.seen(fid)) {
+                // Déjà reçu : si c'est un message privé pour moi, l'expéditeur n'a peut-être pas eu mon accusé -> je le renvoie.
+                if (f.type == Frame.DM && f.toHex == me.id && db.message(fid) != null) {
+                    send(Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), myIdBytes, f.from, f.fid + byteArrayOf(f.hops.toByte())))
+                }
+                return
+            }
             if (recentSeen.size > 5000) recentSeen.entries.removeAll { now - it.value > 600_000 }
         }
         val forMe = f.isBroadcast || f.toHex == me.id
@@ -244,15 +254,21 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             if (!o.mine && now - o.created > keep) { db.removeOutbox(o.fid); continue }
             val isDirect = o.dest != Hex.enc(Frame.BROADCAST)
             var changed = false
+            // Mon message privé remis au destinataire mais toujours sans accusé après 2 min : on le lui redonne (il renverra l'accusé).
+            if (o.mine && isDirect && o.dest in o.sentTo && o.dest in connected) {
+                val last = lastDirectSend[o.fid] ?: 0L
+                if (now - last > 120_000) { o.sentTo.remove(o.dest); changed = true }
+            }
             for (p in connected) {
                 if (p in o.sentTo) continue
-                if (sendTo(p, o.data)) { o.sentTo.add(p); changed = true; MeshService.instance?.messenger?.onRelayed(o, p) }
+                if (sendTo(p, o.data)) { o.sentTo.add(p); changed = true; if (p == o.dest) lastDirectSend[o.fid] = now; MeshService.instance?.messenger?.onRelayed(o, p) }
             }
             if (changed) db.outboxSentTo(o.fid, o.sentTo)
             // Une trame directe remise au destinataire (relais ou trame technique) n'a plus besoin d'attendre.
             if (isDirect && o.dest in o.sentTo && !o.mine) db.removeOutbox(o.fid)
         } catch (e: Exception) { Log.e(tag, "envoi ${o.fid}", e) }
         pendingCount.value = db.outboxCount()
+        pendingDetail.value = db.outboxDetail()
     }
 
     fun myId() = me.id

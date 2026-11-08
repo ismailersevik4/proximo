@@ -112,12 +112,13 @@ fun ProfileScreen(onContacts: () -> Unit, onSettings: () -> Unit) {
         Spacer(Modifier.height(14.dp))
         val peersList by peersState()
         val peersCount = peersList.size
-        val pendingFlow = svc?.core?.pendingCount
-        val pendingOut = if (pendingFlow != null) pendingFlow.collectAsState().value else 0
+        val pendingFlow = svc?.core?.pendingDetail
+        val pendingPair = if (pendingFlow != null) pendingFlow.collectAsState().value else (0 to 0)
         Column(Modifier.fillMaxWidth().background(Px.Card, RoundedCornerShape(18.dp)).padding(16.dp)) {
             Text("Réseau", color = Color.White, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(6.dp))
-            Text("$peersCount téléphone(s) à portée · $pendingOut message(s) en attente de relais", color = Px.Muted, fontSize = 13.sp)
+            Text("$peersCount téléphone(s) à portée", color = Px.Muted, fontSize = 13.sp)
+            Text("${pendingPair.first} message(s) à toi en attente de « Reçu » · ${pendingPair.second} en transit pour d'autres", color = Px.Muted, fontSize = 13.sp)
             Text("Identifiant du téléphone : ${me.id}", color = Px.Muted, fontSize = 11.sp)
         }
         Spacer(Modifier.height(28.dp))
