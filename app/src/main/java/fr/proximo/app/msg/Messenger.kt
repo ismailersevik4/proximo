@@ -380,13 +380,16 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val file = inn.blob?.let { saveBlob(mid, kind, it) }
         val isOpen = openChat == chat
         val route = if (f.hops == 0) "direct" else "${f.hops} saut(s)"
-        db.saveMessage(Message(mid, chat, from, false, kind, body, file, inn.json.optLong("t", System.currentTimeMillis()), Message.DELIVERED, isOpen, route, senderName))
+        val sentAt = inn.json.optLong("t", System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        db.saveMessage(Message(mid, chat, from, false, kind, body, file, sentAt, Message.DELIVERED, isOpen, route, senderName, now))
+        val late = now - sentAt > 3600_000L
         db.touchContact(from)
         val preview = when (kind) {
             Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal (${body}s)"; Message.VIDEO -> "🎬 Vidéo (${body}s)"; Message.LOC -> "📍 Position"; Message.SOS -> "🆘 SOS"; else -> body
         }
         val title = if (chat == Db.ALL) "$senderName · Tout le monde" else if (db.group(chat) != null) "$senderName · ${db.group(chat)?.name}" else senderName
-        if (kind != Message.SOS && !isOpen) notify(title, preview, chat, false)
+        if (kind != Message.SOS && !isOpen) notify(if (late) "$title · écrit le ${java.text.SimpleDateFormat("d MMM HH:mm", java.util.Locale.FRANCE).format(java.util.Date(sentAt))}" else title, preview, chat, false)
         if (kind == Message.VOICE && file != null && settings.autoPlayVoice) playVoice(file)
     }
 

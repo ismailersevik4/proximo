@@ -22,7 +22,11 @@ data class Message(
     val body: String, val file: String?, val time: Long, val status: Int, val read: Boolean, val route: String,
     /** Pseudo de l'expéditeur tel qu'il s'est présenté (utile pour « Tout le monde » et les non-contacts). */
     val senderName: String = "",
+    /** Heure d'arrivée sur ce téléphone (0 = inconnue / message à moi). */
+    val received: Long = 0L,
 ) {
+    /** Arrivé plus d'une heure après avoir été écrit : à signaler. */
+    val late: Boolean get() = !mine && received > 0 && received - time > 3600_000L
     companion object {
         const val PENDING = 0; const val RELAYED = 1; const val DELIVERED = 2; const val FAILED = 3
         const val TEXT = "text"; const val PHOTO = "photo"; const val VOICE = "voice"; const val VIDEO = "video"; const val LOC = "loc"; const val SOS = "sos"; const val SYS = "sys"
@@ -34,7 +38,7 @@ data class ChatSummary(val chat: String, val name: String, val last: Message?, v
 /** Trame rangée en attente (pas encore remise ou à relayer plus tard). */
 data class Outbox(val fid: String, val data: ByteArray, val dest: String, val created: Long, val sentTo: MutableSet<String>, val mine: Boolean)
 
-class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 3) {
+class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 4) {
     /** Les gros contenus (file d'attente, trames mises de côté) sont en fichiers : SQLite refuse les lignes de plus de 2 Mo. */
     private val outboxDir = java.io.File(ctx.filesDir, "outbox").also { it.mkdirs() }
     private val heldDir = java.io.File(ctx.filesDir, "held").also { it.mkdirs() }
@@ -46,7 +50,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         db.execSQL("CREATE TABLE contacts(id TEXT PRIMARY KEY, name TEXT, dh BLOB, sg BLOB, status INTEGER, added INTEGER, last_seen INTEGER)")
         db.execSQL("CREATE TABLE pending_codes(code TEXT PRIMARY KEY, added INTEGER)")
         db.execSQL("CREATE TABLE groups(id TEXT PRIMARY KEY, name TEXT, key BLOB, owner TEXT, members TEXT, created INTEGER)")
-        db.execSQL("CREATE TABLE messages(mid TEXT PRIMARY KEY, chat TEXT, from_id TEXT, mine INTEGER, kind TEXT, body TEXT, file TEXT, time INTEGER, status INTEGER, read INTEGER, route TEXT, sender_name TEXT DEFAULT '')")
+        db.execSQL("CREATE TABLE messages(mid TEXT PRIMARY KEY, chat TEXT, from_id TEXT, mine INTEGER, kind TEXT, body TEXT, file TEXT, time INTEGER, status INTEGER, read INTEGER, route TEXT, sender_name TEXT DEFAULT '', received INTEGER DEFAULT 0)")
         db.execSQL("CREATE INDEX idx_msg_chat ON messages(chat, time)")
         db.execSQL("CREATE TABLE seen(fid TEXT PRIMARY KEY, t INTEGER)")
         db.execSQL("CREATE TABLE outbox(fid TEXT PRIMARY KEY, data BLOB, dest TEXT, created INTEGER, sent_to TEXT, mine INTEGER)")
@@ -56,6 +60,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     override fun onUpgrade(db: SQLiteDatabase, o: Int, n: Int) {
         if (o < 2) db.execSQL("ALTER TABLE messages ADD COLUMN sender_name TEXT DEFAULT ''")
         if (o < 3) { db.execSQL("CREATE TABLE IF NOT EXISTS held(fid TEXT PRIMARY KEY, from_id TEXT, peer TEXT, t INTEGER)"); db.execSQL("DELETE FROM outbox") }
+        if (o < 4) db.execSQL("ALTER TABLE messages ADD COLUMN received INTEGER DEFAULT 0")
     }
 
     // ---------- contacts ----------
@@ -107,12 +112,12 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     fun messages(chat: String, limit: Int = 500): List<Message> =
         q("SELECT * FROM messages WHERE chat=? ORDER BY time DESC LIMIT $limit", chat) { readMsg(it) }.asReversed()
     fun message(mid: String): Message? = q("SELECT * FROM messages WHERE mid=?", mid) { readMsg(it) }.firstOrNull()
-    private fun readMsg(c: Cursor) = Message(c.getString(0), c.getString(1), c.getString(2), c.getInt(3) == 1, c.getString(4), c.getString(5), c.getString(6), c.getLong(7), c.getInt(8), c.getInt(9) == 1, c.getString(10) ?: "", c.getString(11) ?: "")
+    private fun readMsg(c: Cursor) = Message(c.getString(0), c.getString(1), c.getString(2), c.getInt(3) == 1, c.getString(4), c.getString(5), c.getString(6), c.getLong(7), c.getInt(8), c.getInt(9) == 1, c.getString(10) ?: "", c.getString(11) ?: "", c.getLong(12))
 
     fun saveMessage(m: Message) {
         val cv = ContentValues().apply {
             put("mid", m.mid); put("chat", m.chat); put("from_id", m.from); put("mine", if (m.mine) 1 else 0); put("kind", m.kind)
-            put("body", m.body); put("file", m.file); put("time", m.time); put("status", m.status); put("read", if (m.read) 1 else 0); put("route", m.route); put("sender_name", m.senderName)
+            put("body", m.body); put("file", m.file); put("time", m.time); put("status", m.status); put("read", if (m.read) 1 else 0); put("route", m.route); put("sender_name", m.senderName); put("received", m.received)
         }
         writableDatabase.insertWithOnConflict("messages", null, cv, SQLiteDatabase.CONFLICT_REPLACE); bump()
     }
@@ -153,21 +158,32 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         writableDatabase.execSQL("INSERT OR IGNORE INTO seen VALUES(?,?)", arrayOf(fid, System.currentTimeMillis()))
     }
     fun purgeOld() {
-        val d = System.currentTimeMillis() - 7L * 24 * 3600 * 1000
-        writableDatabase.delete("seen", "t<?", arrayOf((System.currentTimeMillis() - 10L * 24 * 3600 * 1000).toString()))
-        // Mes messages jamais remis après 7 jours : marqués « Échec » (ils ne repartiront plus).
+        val d = System.currentTimeMillis() - 30L * 24 * 3600 * 1000
+        writableDatabase.delete("seen", "t<?", arrayOf((System.currentTimeMillis() - 40L * 24 * 3600 * 1000).toString()))
+        // Mes messages jamais remis après 30 jours : marqués « Échec » (ils ne repartiront plus).
         for (fid in q("SELECT fid FROM outbox WHERE created<? AND mine=1", d.toString()) { it.getString(0) }) {
             writableDatabase.execSQL("UPDATE messages SET status=? WHERE mid=? AND status=?", arrayOf(Message.FAILED, fid, Message.PENDING))
         }
         for (fid in q("SELECT fid FROM outbox WHERE created<?", d.toString()) { it.getString(0) }) removeOutbox(fid)
-        val h = System.currentTimeMillis() - 24L * 3600 * 1000
+        val h = System.currentTimeMillis() - 7L * 24 * 3600 * 1000
         for (fid in q("SELECT fid FROM held WHERE t<?", h.toString()) { it.getString(0) }) removeHeld(fid)
+        capOutbox()
         bump()
+    }
+
+    /** Plafond de stockage des relais (300 Mo) : on efface d'abord ce qui n'est pas à moi, le plus lourd et le plus vieux. */
+    private fun capOutbox() {
+        val files = (outboxDir.listFiles() ?: return).toList()
+        var total = files.sumOf { it.length() }
+        if (total <= OUTBOX_CAP) return
+        val mine = q("SELECT fid FROM outbox WHERE mine=1") { it.getString(0) }.toSet()
+        val candidates = files.filter { it.nameWithoutExtension !in mine }.sortedWith(compareByDescending<java.io.File> { it.length() > 500_000 }.thenBy { it.lastModified() })
+        for (f in candidates) { if (total <= OUTBOX_CAP) break; total -= f.length(); removeOutbox(f.nameWithoutExtension) }
     }
 
     // ---------- file d'attente (contenu en fichiers) ----------
     fun outbox(): List<Outbox> {
-        val rows = q("SELECT fid, dest, created, sent_to, mine FROM outbox ORDER BY created") {
+        val rows = q("SELECT fid, dest, created, sent_to, mine FROM outbox ORDER BY created DESC") {
             val set = HashSet<String>(); val arr = JSONArray(it.getString(3)); for (i in 0 until arr.length()) set.add(arr.getString(i))
             Outbox(it.getString(0), ByteArray(0), it.getString(1), it.getLong(2), set, it.getInt(4) == 1)
         }
@@ -214,6 +230,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
 
     companion object {
         const val ALL = "all"
+        const val OUTBOX_CAP = 300L * 1024 * 1024
         @Volatile private var inst: Db? = null
         fun get(ctx: Context): Db = inst ?: synchronized(this) { inst ?: Db(ctx.applicationContext).also { inst = it } }
         fun jsonObj(s: String): JSONObject = try { JSONObject(s) } catch (e: Exception) { JSONObject() }

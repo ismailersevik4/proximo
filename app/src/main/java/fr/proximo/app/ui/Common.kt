@@ -49,6 +49,14 @@ fun timeStr(t: Long): String {
     return SimpleDateFormat("d MMM", Locale.FRANCE).format(Date(t))
 }
 
+/** Heure seule aujourd'hui, sinon « 8 nov. 22:46 ». */
+fun stamp(t: Long): String {
+    val now = Calendar.getInstance(); val c = Calendar.getInstance().apply { timeInMillis = t }
+    val sameDay = now.get(Calendar.YEAR) == c.get(Calendar.YEAR) && now.get(Calendar.DAY_OF_YEAR) == c.get(Calendar.DAY_OF_YEAR)
+    return if (sameDay) SimpleDateFormat("HH:mm", Locale.FRANCE).format(Date(t)) else SimpleDateFormat("d MMM HH:mm", Locale.FRANCE).format(Date(t))
+}
+fun fullStamp(t: Long): String = SimpleDateFormat("EEEE d MMMM yyyy 'à' HH:mm:ss", Locale.FRANCE).format(Date(t)).replaceFirstChar { it.uppercase() }
+
 fun dayLabel(t: Long): String {
     val now = Calendar.getInstance(); val c = Calendar.getInstance().apply { timeInMillis = t }
     if (now.get(Calendar.YEAR) == c.get(Calendar.YEAR) && now.get(Calendar.DAY_OF_YEAR) == c.get(Calendar.DAY_OF_YEAR)) return "Aujourd'hui"

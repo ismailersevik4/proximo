@@ -285,8 +285,11 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
     val bg = when { isSos -> Px.Danger.copy(alpha = 0.25f); m.mine -> Px.AccentDark; else -> Px.Card2 }
     val shape = if (m.mine) RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp) else RoundedCornerShape(18.dp, 18.dp, 18.dp, 4.dp)
     var menu by remember { mutableStateOf(false) }
+    var details by remember { mutableStateOf(false) }
+    if (details) MessageDetails(m, contactName) { details = false }
     Box(Modifier.fillMaxWidth().padding(vertical = 3.dp), contentAlignment = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart) {
         DropdownMenu(menu, { menu = false }) {
+            DropdownMenuItem(text = { Text("Détails") }, onClick = { menu = false; details = true })
             if (m.kind == Message.TEXT) DropdownMenuItem(text = { Text("Copier le texte") }, onClick = {
                 menu = false
                 (ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("Proximo", m.body))
@@ -326,8 +329,9 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                 }
                 else -> Text(m.body, color = Color.White, fontSize = 15.sp)
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-                Text(timeStr(m.time), color = if (m.mine) Px.AccentSoft else Px.Muted, fontSize = 11.sp)
+            if (m.late) Text("Reçu ${stamp(m.received).lowercase()} · écrit ${stamp(m.time).lowercase()}", color = Px.Warn, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+            Row(Modifier.fillMaxWidth().clickable { details = true }, horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                Text(stamp(m.time), color = if (m.mine) Px.AccentSoft else Px.Muted, fontSize = 11.sp)
                 if (m.mine) {
                     Spacer(Modifier.width(6.dp))
                     val (label, color) = when (m.status) {
@@ -341,6 +345,24 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
             }
         }
     }
+}
+
+@Composable
+private fun MessageDetails(m: Message, contactName: (String) -> String?, onClose: () -> Unit) {
+    val lines = buildList {
+        add("Écrit : " + fullStamp(m.time))
+        if (!m.mine && m.received > 0) add("Reçu : " + fullStamp(m.received) + if (m.late) "  (en retard)" else "")
+        if (!m.mine) add("De : " + (contactName(m.from) ?: m.senderName.ifEmpty { "Inconnu" }))
+        add("Chemin : " + m.route.ifEmpty { if (m.mine) when (m.status) { Message.DELIVERED -> "reçu"; Message.RELAYED -> "relayé"; Message.FAILED -> "échec"; else -> "en attente" } else "direct" })
+        add("Type : " + when (m.kind) { Message.PHOTO -> "photo"; Message.VOICE -> "vocal (${m.body} s)"; Message.VIDEO -> "vidéo (${m.body} s)"; Message.LOC -> "position"; Message.SOS -> "SOS"; else -> "texte" })
+        m.file?.let { f -> val size = File(f).length(); if (size > 0) add("Taille : " + if (size > 1_000_000) "${size / 1_000_000} Mo" else "${size / 1000} Ko") }
+    }
+    AlertDialog(
+        onDismissRequest = onClose, containerColor = Px.Card,
+        title = { Text("Détails du message", color = Color.White) },
+        text = { Column { lines.forEach { Text(it, color = Px.Muted, fontSize = 14.sp, modifier = Modifier.padding(vertical = 2.dp)) } } },
+        confirmButton = { TextButton(onClick = onClose) { Text("Fermer") } },
+    )
 }
 
 @Composable
