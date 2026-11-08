@@ -95,7 +95,7 @@ class MeshService : Service() {
 
         fun start(ctx: Context) {
             if (!Identity.get(ctx).isReady) return
-            ContextCompat.startForegroundService(ctx, Intent(ctx, MeshService::class.java))
+            try { ContextCompat.startForegroundService(ctx, Intent(ctx, MeshService::class.java)) } catch (e: Exception) { android.util.Log.w("Proximo", "démarrage du service", e) }
         }
         fun stop(ctx: Context) { ctx.stopService(Intent(ctx, MeshService::class.java)) }
 

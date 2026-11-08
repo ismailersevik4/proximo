@@ -7,7 +7,7 @@ import java.nio.ByteBuffer
 /**
  * Trame qui circule de téléphone en téléphone.
  *
- *  'P' 'X' | ver | type | ttl | hops | flags | fid(16) | from(8) | to(8) | len(2) | payload
+ *  'P' 'X' | ver | type | ttl | hops | flags | fid(16) | from(8) | to(8) | len(4) | payload
  *
  *  - fid   : identifiant unique de la trame (sert au dédoublonnage et aux accusés de réception)
  *  - from  : nœud émetteur d'origine ; to : destinataire (8 octets à zéro = tout le monde)
@@ -35,7 +35,7 @@ class Frame(
         b.put('P'.code.toByte()).put('X'.code.toByte()).put(VERSION.toByte()).put(type.toByte())
         b.put(ttl.toByte()).put(hops.toByte()).put(flags.toByte())
         b.put(fid).put(from).put(to)
-        b.putShort(payload.size.toShort())
+        b.putInt(payload.size)
         b.put(payload)
         return b.array()
     }
@@ -45,8 +45,8 @@ class Frame(
 
     companion object {
         const val VERSION = 1
-        const val HEADER = 2 + 1 + 1 + 1 + 1 + 1 + 16 + 8 + 8 + 2
-        const val MAX_PAYLOAD = 0xFFFF
+        const val HEADER = 2 + 1 + 1 + 1 + 1 + 1 + 16 + 8 + 8 + 4
+        const val MAX_PAYLOAD = 4_000_000
         const val DEFAULT_TTL = 7
 
         // Types de trames
@@ -81,8 +81,8 @@ class Frame(
             val fid = ByteArray(16); b.get(fid)
             val from = ByteArray(8); b.get(from)
             val to = ByteArray(8); b.get(to)
-            val len = b.short.toInt() and 0xffff
-            if (data.size < HEADER + len) return null
+            val len = b.int
+            if (len < 0 || len > MAX_PAYLOAD || data.size < HEADER + len) return null
             val payload = ByteArray(len); b.get(payload)
             return Frame(type, ttl, hops, flags, fid, from, to, payload)
         }
@@ -90,7 +90,7 @@ class Frame(
         /** Longueur totale annoncée par un en-tête (pour lire un flux). */
         fun totalLength(header: ByteArray): Int {
             if (header.size < HEADER) return -1
-            val len = ByteBuffer.wrap(header, HEADER - 2, 2).short.toInt() and 0xffff
+            val len = ByteBuffer.wrap(header, HEADER - 4, 4).int
             return HEADER + len
         }
     }

@@ -1,5 +1,38 @@
 # Proximo
 
-Messagerie sans Internet (Bluetooth / Wi-Fi direct) pour Android.
+Messagerie Android **sans Internet** : les téléphones se parlent directement en Bluetooth basse consommation et en Wi-Fi direct (Wi-Fi Aware), et chaque téléphone relaie les messages des autres (réseau maillé).
 
-Conçu et développé par Ismail Ersevik.
+Conçu et développé par **Ismail Ersevik**.
+
+## Ce que fait l'appli (version 1.0.0, APK 1)
+
+- **Radar** : les téléphones Proximo à portée, avec distance approximative, ceux déjà en contact et les inconnus (« ? »).
+- **Contacts** : ajout depuis le radar, par QR code ou par code `PRX-XXXX-XXXX` (l'ajout se fait dès que les deux téléphones sont à portée).
+- **Messages privés chiffrés** de bout en bout (X25519 + AES-GCM, signés Ed25519), statuts « En attente → Relayé par… → Reçu ».
+- **Photos** (compressées), **talkie-walkie** (vocal, lu automatiquement à l'arrivée), **position**, **SOS** prioritaire à tout le monde.
+- **Groupes** (clé de groupe partagée) et canal **« Tout le monde »** (public, à portée).
+- **Appels vocaux en direct** (bêta) quand les deux téléphones sont à portée Wi-Fi direct.
+- **Messages en attente** : ce qui ne peut pas partir est gardé et part dès qu'un voisin apparaît.
+- **Mises à jour** depuis l'appli : par Internet (Releases GitHub) ou **de téléphone à téléphone** par Wi-Fi direct.
+- Modes **Normal / Priorité portée / Priorité batterie**.
+
+Android 8 et plus. Interface en français.
+
+## Installer
+
+Télécharger `Proximo.apk` dans [Releases](https://github.com/ismailersevik4/proximo/releases/tag/android), l'ouvrir sur le téléphone et accepter l'installation. Ensuite, l'appli propose elle-même les nouvelles versions.
+
+## Compilation
+
+GitHub Actions compile et signe l'APK à chaque modification (`.github/workflows/apk.yml`). La clé de signature est dans `signing/proximo.jks.enc`, chiffrée ; seul le secret `ANDROID_KEYSTORE_PASS` permet de l'ouvrir.
+
+Pour une nouvelle version : augmenter `appVersionCode` (+1) et `appVersionName` dans `app/build.gradle.kts`.
+
+## Organisation du code
+
+- `core/` : identité et clés, chiffrement, base de données, réglages.
+- `mesh/` : trames, Bluetooth (`BleTransport`), Wi-Fi Aware (`AwareTransport`), relais et file d'attente (`MeshCore`), service de premier plan.
+- `msg/` : messagerie (contacts, groupes, messages, notifications).
+- `call/` : appels vocaux directs.
+- `update/` : mises à jour (Internet et voisin à voisin).
+- `ui/` : écrans Jetpack Compose.
