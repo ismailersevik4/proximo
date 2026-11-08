@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,7 +52,8 @@ fun UpdateBanner(modifier: Modifier) {
     val info by up.available.collectAsState()
     val progress by up.progress.collectAsState()
     val msg by up.message.collectAsState()
-    if (info == null && progress < 0 && msg == null) return
+    val needPerm by up.needsInstallPermission.collectAsState()
+    if (info == null && progress < 0 && msg == null && !needPerm) return
     Column(modifier.fillMaxWidth().padding(12.dp).background(Px.Card, RoundedCornerShape(14.dp)).padding(14.dp)) {
         if (progress >= 0) {
             Text("Mise à jour en cours… $progress %", color = Color.White, fontWeight = FontWeight.Bold)
@@ -63,6 +65,13 @@ fun UpdateBanner(modifier: Modifier) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 TextButton(onClick = { up.dismiss() }) { Text("Plus tard", color = Px.Muted) }
                 TextButton(onClick = { if (i.fromPeer != null) up.requestFromPeer(i.fromPeer) else up.downloadAndInstall(); up.available.value = null }) { Text("Installer", fontWeight = FontWeight.Bold) }
+            }
+        }
+        if (needPerm) {
+            Text("Mise à jour prête. Android doit autoriser Proximo à installer des applis : appuie sur Autoriser, active l'option, puis reviens dans Proximo.", color = Px.Warn, fontSize = 13.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { up.needsInstallPermission.value = false }) { Text("Plus tard", color = Px.Muted) }
+                TextButton(onClick = { up.requestInstallPermission() }) { Text("Autoriser", fontWeight = FontWeight.Bold) }
             }
         }
         msg?.let { Text(it, color = Px.Warn, fontSize = 13.sp, modifier = Modifier.clickable { up.dismiss() }) }
@@ -89,7 +98,7 @@ fun CallScreen(s: CallState) {
     val calls = svc?.calls
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(s.phase) { while (true) { delay(1000); now = System.currentTimeMillis() } }
-    Column(Modifier.fillMaxSize().background(Px.Bg).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
+    Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
         Spacer(Modifier.height(40.dp))
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Avatar(s.peerName, 110.dp, color = Px.Avatar)
@@ -100,7 +109,7 @@ fun CallScreen(s: CallState) {
                 when (s.phase) {
                     CallState.SEARCHING -> "Recherche d'un chemin via un voisin…"
                     CallState.RINGING_IN -> "Appel entrant"
-                    CallState.RINGING_OUT -> "Appel en cours…"
+                    CallState.RINGING_OUT -> "Ça sonne…"
                     else -> { val sec = (now - s.since) / 1000; String.format("%02d:%02d", sec / 60, sec % 60) }
                 }, color = Px.AccentSoft, fontSize = 16.sp,
             )

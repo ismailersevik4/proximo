@@ -58,6 +58,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     @Volatile private var running = false
     private var server: ServerSocket? = null
     private var serverPort = 0
+    private var lastInfo: ByteArray = ByteArray(0)
 
     private inner class Peer(val id: String) {
         var pubHandle: PeerHandle? = null   // vu par mon abonnement (il publie)
@@ -69,6 +70,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         val queue = LinkedBlockingDeque<ByteArray>()
         var failures = 0
         var nextTry = 0L
+        var announced = false
         var network: Network? = null
         var cb: ConnectivityManager.NetworkCallback? = null
         var connecting = false
@@ -183,8 +185,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             p.name = String(f.payload)
             listener.onPeerSeen(id, p.name, name, 0)
             // L'éditeur (plus grand identifiant) prépare la voie de données dès qu'un abonné se signale.
-            if (fromPublish && myId > id) acceptDataPath(p)
-            MeshService.instance?.core?.onLinkReady(id)
+            if (fromPublish && myId > id && p.out == null) acceptDataPath(p)
+            if (!p.announced) { p.announced = true; MeshService.instance?.core?.onLinkReady(id) }
             return
         }
         listener.onFrame(message, id, name)
@@ -207,7 +209,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     private fun acceptDataPath(p: Peer) {
         if (Build.VERSION.SDK_INT < 29) return
         val s = pub ?: return; val h = p.subHandle ?: return
-        if (p.out != null || p.connecting || System.currentTimeMillis() < p.nextTry) return
+        if (p.out != null || p.cb != null) return   // déjà armé (le répondeur attend passivement)
         p.connecting = true
         val spec = WifiAwareNetworkSpecifier.Builder(s, h).setPskPassphrase(PSK).setPort(serverPort).build()
         request(p, spec, initiator = false)
@@ -234,7 +236,14 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         p.failures++
         val wait = when (p.failures) { 1 -> 5_000L; 2 -> 15_000L; else -> 60_000L }
         p.nextTry = System.currentTimeMillis() + wait
-        handler.postDelayed({ if (running && peers[p.id] === p && p.out == null) { if (myId < p.id) requestDataPath(p) else acceptDataPath(p) } }, wait + 100)
+        handler.postDelayed({
+            if (!running || peers[p.id] !== p || p.out != null) return@postDelayed
+            if (myId < p.id) {
+                // Je me re-signale (l'éditeur réarme sa voie de données à la réception du HELLO), puis je redemande.
+                p.pubHandle?.let { h -> sub?.sendMessage(h, p.msgId++, hello()) }
+                handler.postDelayed({ if (running && peers[p.id] === p && p.out == null) requestDataPath(p) }, 1500)
+            } else acceptDataPath(p)
+        }, wait + 100)
     }
 
     private fun request(p: Peer, spec: WifiAwareNetworkSpecifier, initiator: Boolean) {
@@ -253,7 +262,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                         val sock = network.socketFactory.createSocket()
                         sock.connect(InetSocketAddress(addr, port), 8000)
                         serve(sock, p)
-                    } catch (e: Exception) { Log.w(tag, "connexion prise", e); scheduleRetry(p) }
+                    } catch (e: Exception) { Log.w(tag, "connexion prise", e); if (p.cb === this) releaseRequest(p); scheduleRetry(p) }
                 }
             }
             override fun onLost(network: Network) { closeSocket(p); if (p.cb === this) releaseRequest(p); scheduleRetry(p) }
@@ -261,7 +270,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         }
         p.cb = cb
         try { cm.requestNetwork(req, cb, handler) } catch (e: Exception) { releaseRequest(p); scheduleRetry(p); Log.w(tag, "requête réseau", e) }
-        handler.postDelayed({ if (p.out == null && p.cb === cb) { releaseRequest(p); scheduleRetry(p) } }, 30_000)
+        // Seul l'initiateur a un délai : le répondeur reste armé tant que le pair est là.
+        if (initiator) handler.postDelayed({ if (p.out == null && p.cb === cb) { releaseRequest(p); scheduleRetry(p) } }, 30_000)
     }
 
     /** Boucle d'une prise : on s'identifie, puis on lit les trames (longueur sur 4 octets + trame). */
@@ -284,13 +294,16 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             listener.onPeerSeen(id, p.name, name, 0)
             MeshService.instance?.core?.onLinkReady(id)
             exec.execute {
+                var pending: ByteArray? = null
                 try {
                     while (p.socket === sock) {
                         val d = p.queue.poll(1, TimeUnit.SECONDS) ?: continue
                         if (p.socket !== sock) { p.queue.offerFirst(d); break }
+                        pending = d
                         synchronized(out) { writeFrame(out, d) }
+                        pending = null
                     }
-                } catch (_: Exception) {}
+                } catch (_: Exception) { pending?.let { p.queue.offerFirst(it) } }
             }
             while (true) {
                 val data = readFrame(inp) ?: break
@@ -300,7 +313,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         } catch (e: Exception) { Log.i(tag, "prise fermée : ${e.message}") }
         finally {
             try { sock.close() } catch (_: Exception) {}
-            peer?.let { if (it.socket === sock) { it.socket = null; it.out = null } }
+            peer?.let { if (it.socket === sock) { closeSocket(it); if (running && peers[it.id] === it) scheduleRetry(it) } }
         }
     }
 
@@ -308,7 +321,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     private fun readFrame(inp: InputStream): ByteArray? {
         val din = if (inp is DataInputStream) inp else DataInputStream(inp)
         val len = try { din.readInt() } catch (e: Exception) { return null }
-        if (len <= 0 || len > 4_000_000) return null
+        if (len <= 0 || len > Frame.HEADER + Frame.MAX_PAYLOAD) return null
         val buf = ByteArray(len)
         try { din.readFully(buf) } catch (e: Exception) { return null }
         return buf
@@ -331,10 +344,13 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             val now = System.currentTimeMillis()
             for (p in peers.values.toList()) {
                 if (p.out != null) { p.lastSeen = now; listener.onPeerSeen(p.id, p.name, name, 0); continue }
-                if (now - p.lastSeen > 120_000) { closePeer(p); peers.remove(p.id); listener.onPeerLost(p.id, name) }
+                if (now - p.lastSeen > 180_000) { closePeer(p); peers.remove(p.id); listener.onPeerLost(p.id, name); continue }
+                // Sans prise, on se signale pour rester visibles l'un pour l'autre (le HELLO reçu rafraîchit lastSeen chez l'autre).
+                try { p.pubHandle?.let { h -> sub?.sendMessage(h, p.msgId++, hello()) } ?: p.subHandle?.let { h -> pub?.sendMessage(h, p.msgId++, hello()) } } catch (_: Exception) {}
             }
-            // Le pseudo peut avoir changé : on republie.
-            if (pub != null) try { pub?.updatePublish(PublishConfig.Builder().setServiceName(SERVICE).setServiceSpecificInfo(info()).build()) } catch (_: Exception) {}
+            // Le pseudo a changé : on republie.
+            val i = info()
+            if (pub != null && !i.contentEquals(lastInfo)) { lastInfo = i; try { pub?.updatePublish(PublishConfig.Builder().setServiceName(SERVICE).setServiceSpecificInfo(i).build()) } catch (_: Exception) {} }
             handler.postDelayed(this, if (mode == Modes.BATTERIE) 60_000 else 20_000)
         }
     }

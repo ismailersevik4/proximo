@@ -27,6 +27,7 @@ import fr.proximo.app.mesh.Frame
 import fr.proximo.app.mesh.MeshCore
 import fr.proximo.app.mesh.Peer
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -43,6 +44,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private val me = Identity.get(ctx)
     private val settings = Settings.get(ctx)
     private val mediaDir = File(ctx.filesDir, "media").also { it.mkdirs() }
+    private val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
 
     /** Cartes (clés publiques) des téléphones vus, même pas encore contacts. */
     val cards = ConcurrentHashMap<String, Card>()
@@ -58,7 +60,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
 
     // =============== côté utilisateur ===============
 
-    fun sendText(chat: String, text: String) = sendMessage(chat, Message.TEXT, text.trim(), null)
+    fun sendText(chat: String, text: String) = sendMessage(chat, Message.TEXT, text.trim().take(4000), null)
     fun sendPhoto(chat: String, jpeg: ByteArray) = sendMessage(chat, Message.PHOTO, "", jpeg)
     fun sendVoice(chat: String, audio: ByteArray, seconds: Int) = sendMessage(chat, Message.VOICE, seconds.toString(), audio)
     /** Vidéo courte : uniquement par Wi-Fi direct, un seul relais au maximum. */
@@ -77,7 +79,12 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         sendMessage(Db.ALL, Message.SOS, body, null)
     }
 
+    /** Chiffrement et écriture des fichiers hors du fil de l'interface (une vidéo de 4 Mo gèlerait l'écran). */
     private fun sendMessage(chat: String, kind: String, body: String, blob: ByteArray?, flags: Int = 0, ttl: Int = Frame.DEFAULT_TTL) {
+        scope.launch { try { sendMessageNow(chat, kind, body, blob, flags, ttl) } catch (e: Exception) { Log.e(tag, "envoi", e); event("Envoi impossible : ${e.message}") } }
+    }
+
+    private fun sendMessageNow(chat: String, kind: String, body: String, blob: ByteArray?, flags: Int, ttl: Int) {
         val fid = Frame.newId()
         val mid = Hex.enc(fid)
         val time = System.currentTimeMillis()
@@ -171,6 +178,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     fun acceptContact(id: String) {
         val c = db.contact(id) ?: return
         db.setContactStatus(id, 1)
+        core.replayHeld(id)
         core.send(Frame(Frame.CONTACT_ACCEPT, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(id), me.card().toJson().toString().toByteArray()))
         db.saveMessage(Message(Hex.enc(Frame.newId()), id, me.id, true, Message.SYS, "Vous êtes maintenant en contact", null, System.currentTimeMillis(), Message.DELIVERED, true, ""))
     }
@@ -230,6 +238,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private fun onCard(f: Frame) {
         val card = cardOf(f) ?: return
         cards[card.id] = card
+        core.replayHeld(card.id)
         db.contact(card.id)?.let { if (it.name != card.name && it.accepted) db.renameContact(card.id, card.name) }
         // Quelqu'un attendait cette carte ?
         if (wantContact.remove(card.id)) addFromCard(card)
@@ -239,6 +248,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private fun onContactReq(f: Frame) {
         val card = cardOf(f) ?: return
         cards[card.id] = card
+        core.replayHeld(card.id)
         val existing = db.contact(card.id)
         when {
             existing?.accepted == true -> { db.saveContact(card, 1); core.send(Frame(Frame.CONTACT_ACCEPT, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray())) }
@@ -251,6 +261,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val card = cardOf(f) ?: return
         cards[card.id] = card
         db.saveContact(card, 1)
+        core.replayHeld(card.id)
         db.saveMessage(Message(Hex.enc(Frame.newId()), card.id, card.id, false, Message.SYS, "${card.name} a accepté ta demande", null, System.currentTimeMillis(), Message.DELIVERED, openChat == card.id, ""))
         notify("Contact accepté", "${card.name} a accepté ta demande", card.id, false)
     }
@@ -287,6 +298,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
             if (existing != null && existing.owner != from) return
             val g = Group(o.getString("id"), o.getString("name"), B64.dec(o.getString("key")), o.getString("owner"), m, System.currentTimeMillis())
             db.saveGroup(g)
+            core.replayHeld(null)
             if (existing == null) {
                 val who = db.contact(from)?.name ?: "Un contact"
                 db.saveMessage(Message(Hex.enc(Frame.newId()), g.id, from, false, Message.SYS, "$who t'a ajouté au groupe", null, System.currentTimeMillis(), Message.DELIVERED, false, ""))

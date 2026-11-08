@@ -200,7 +200,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                     DropdownMenuItem(text = { Text("Prendre une photo") }, leadingIcon = { Icon(Icons.Filled.PhotoCamera, null) }, onClick = { attach = false; askCamera.launch(android.Manifest.permission.CAMERA) })
                     DropdownMenuItem(text = { Text("Photo de la galerie") }, leadingIcon = { Icon(Icons.Filled.Image, null) }, onClick = { attach = false; pickImage.launch("image/*") })
                     DropdownMenuItem(text = { Text("Filmer une vidéo (15 s)") }, leadingIcon = { Icon(Icons.Filled.Videocam, null) }, onClick = { attach = false; videoGuard { askCameraVideo.launch(android.Manifest.permission.CAMERA) } })
-                    DropdownMenuItem(text = { Text("Vidéo de la galerie (4 Mo max)") }, leadingIcon = { Icon(Icons.Filled.Videocam, null) }, onClick = { attach = false; videoGuard { pickVideo.launch("video/*") } })
+                    DropdownMenuItem(text = { Text("Vidéo de la galerie (3,5 Mo max)") }, leadingIcon = { Icon(Icons.Filled.Videocam, null) }, onClick = { attach = false; videoGuard { pickVideo.launch("video/*") } })
                     DropdownMenuItem(text = { Text("Ma position") }, leadingIcon = { Icon(Icons.Filled.Place, null) }, onClick = {
                         attach = false
                         scope.launch { val l = Locations.current(ctx); if (l != null) svc?.messenger?.sendLocation(chat, l.latitude, l.longitude) else svc?.messenger?.event("Position introuvable (GPS éteint ?)") }

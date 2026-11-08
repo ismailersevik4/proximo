@@ -44,6 +44,9 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     private val me = Identity.get(ctx)
     private val myIdBytes = Hex.dec(me.id)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** Réception sérialisée : une trame à la fois, dans l'ordre d'arrivée (pas de doublons ni de désordre). */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val rx = Dispatchers.IO.limitedParallelism(1)
     private val lock = Mutex()
     private val recentSeen = ConcurrentHashMap<String, Long>()
 
@@ -109,7 +112,18 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
 
     override fun onFrame(data: ByteArray, peerId: String, transport: String) {
         val f = Frame.decode(data) ?: return
-        scope.launch { receive(f, peerId) }
+        scope.launch(rx) { try { receive(f, peerId) } catch (e: Exception) { Log.e(tag, "réception", e) } }
+    }
+
+    /** Rejoue les trames mises de côté (clé reçue, contact accepté, groupe rejoint). from = null : toutes. */
+    fun replayHeld(from: String?) {
+        scope.launch(rx) {
+            for ((fid, data, peer) in db.held(from)) {
+                db.removeHeld(fid)
+                val f = Frame.decode(data) ?: continue
+                try { receive(f, peer, replay = true) } catch (e: Exception) { Log.e(tag, "rejeu", e) }
+            }
+        }
     }
 
     /** Une liaison de données vient de s'ouvrir : on envoie tout de suite ce qui attend, et on prévient la messagerie. */
@@ -124,7 +138,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     fun onDeliveryFailed(peerId: String) {
         scope.launch {
             lock.withLock {
-                for (o in db.outbox()) if (o.sentTo.remove(peerId)) db.outboxSentTo(o.fid, o.sentTo)
+                try { for (o in db.outbox()) if (o.sentTo.remove(peerId)) db.outboxSentTo(o.fid, o.sentTo) } catch (e: Exception) { Log.e(tag, "échec de remise", e) }
             }
         }
     }
@@ -142,11 +156,11 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     }
 
     // ---------------- réception ----------------
-    private suspend fun receive(f: Frame, fromPeer: String) {
+    private suspend fun receive(f: Frame, fromPeer: String, replay: Boolean = false) {
         val fid = f.fidHex
         if (f.fromHex == me.id) return
         val now = System.currentTimeMillis()
-        if (f.relayable) {
+        if (f.relayable && !replay) {
             if (recentSeen.containsKey(fid) || db.seen(fid)) return
             if (recentSeen.size > 5000) recentSeen.entries.removeAll { now - it.value > 600_000 }
         }
@@ -160,8 +174,12 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         if (forMe) {
             handled = try { handler?.invoke(f, fromPeer) ?: true } catch (e: Exception) { Log.e(tag, "traitement", e); true }
         }
-        // Dédoublonnage : une trame pour moi que je n'ai pas pu traiter (clé pas encore reçue) pourra être rejouée.
-        if (f.relayable && (handled || !forMe || f.isBroadcast)) { recentSeen[fid] = now; db.markSeen(fid) }
+        // Dédoublonnage : une trame pour moi que je n'ai pas pu traiter (clé pas encore reçue) est mise de côté et rejouée plus tard.
+        if (f.relayable) {
+            recentSeen[fid] = now; db.markSeen(fid)
+            if (forMe && !handled) db.saveHeld(fid, f.encode(), f.fromHex, fromPeer)
+        }
+        if (replay) return
         // Un accusé de réception vide les files d'attente de tous les relais.
         if (f.type == Frame.ACK && f.payload.size >= 16) db.removeOutbox(Hex.enc(f.payload.copyOfRange(0, 16)))
         // Relais : tout ce qui est relayable et pas uniquement pour moi, tant qu'il reste des sauts.
@@ -216,7 +234,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val connected = connectedPeerIds()
         if (connected.isEmpty()) return@withLock
         val now = System.currentTimeMillis()
-        for (o in db.outbox()) {
+        val entries = try { db.outbox() } catch (e: Exception) { Log.e(tag, "file d'attente", e); emptyList() }
+        for (o in entries) try {
             // Ce qui n'est pas à moi n'est gardé qu'une heure ; le mien trois jours (purge).
             if (!o.mine && now - o.created > 3600_000) { db.removeOutbox(o.fid); continue }
             val isDirect = o.dest != Hex.enc(Frame.BROADCAST)
@@ -228,7 +247,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             if (changed) db.outboxSentTo(o.fid, o.sentTo)
             // Une trame directe remise au destinataire (relais ou trame technique) n'a plus besoin d'attendre.
             if (isDirect && o.dest in o.sentTo && !o.mine) db.removeOutbox(o.fid)
-        }
+        } catch (e: Exception) { Log.e(tag, "envoi ${o.fid}", e) }
         pendingCount.value = db.outboxCount()
     }
 

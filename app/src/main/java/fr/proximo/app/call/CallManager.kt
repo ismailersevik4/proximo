@@ -66,7 +66,10 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
 
     // Chiffrement de la session
     private var key: ByteArray? = null
-    private var salt = ByteArray(7)
+    private var salt = ByteArray(7)        // aléa de l'appelant (dans l'IV)
+    private var mySalt = ByteArray(0)      // mon aléa pour la clé
+    private var peerSalt = ByteArray(0)    // l'aléa de l'autre pour la clé
+    private var lastPacketAt = 0L
     private var sendDir: Byte = 1
     private var seq = 0
     private var lastRecvSeq = -1
@@ -93,11 +96,11 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     }
 
     private fun startOutgoing(peerId: String, name: String, via: String?) {
-        salt = Crypto.random(7); sendDir = 1; seq = 0; lastRecvSeq = -1
-        key = deriveKey(peerId)
+        salt = Crypto.random(7); mySalt = Crypto.random(16); peerSalt = ByteArray(0); sendDir = 1; seq = 0; lastRecvSeq = -1
+        key = null // la clé sera dérivée quand l'appelé aura renvoyé son aléa (accept)
         val viaName = via?.let { db.contact(it)?.name ?: core.peer(it)?.name }
         state.value = CallState(CallState.RINGING_OUT, peerId, name, System.currentTimeMillis(), via = via, viaName = viaName)
-        val j = JSONObject().put("c", "invite").put("salt", B64.enc(salt)).apply { if (via != null) put("via", via) }
+        val j = JSONObject().put("c", "invite").put("salt", B64.enc(salt)).put("ks", B64.enc(mySalt)).apply { if (via != null) put("via", via) }
         sendJson(peerId, j, via)
         handler.postDelayed({ val st = state.value; if (st.phase == CallState.RINGING_OUT && st.peerId == peerId) { hangup(); MeshService.instance?.messenger?.event("Pas de réponse") } }, 45_000)
     }
@@ -105,7 +108,10 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     fun accept() {
         val s = state.value; if (s.phase != CallState.RINGING_IN) return
         stopRing()
-        sendJson(s.peerId, JSONObject().put("c", "accept"), s.via)
+        mySalt = Crypto.random(16)
+        key = deriveKey(s.peerId, peerSalt, mySalt)
+        if (key == null) { reject(); return }
+        sendJson(s.peerId, JSONObject().put("c", "accept").put("ks", B64.enc(mySalt)), s.via)
         startAudio(s)
     }
 
@@ -133,11 +139,12 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     }
     private fun sendJson(peerId: String, j: JSONObject, via: String?) = sendFrame(peerId, j.toString().toByteArray(), via)
 
-    /** Clé de session : X25519(ma clé, sa clé) -> HKDF avec les deux identifiants triés. */
-    private fun deriveKey(peerId: String): ByteArray? {
+    /** Clé de session, différente à chaque appel : X25519(ma clé, sa clé) + aléa de l'appelant + aléa de l'appelé -> HKDF. */
+    private fun deriveKey(peerId: String, callerSalt: ByteArray, calleeSalt: ByteArray): ByteArray? {
         val pub = contactKey(peerId) ?: return null
+        if (callerSalt.size != 16 || calleeSalt.size != 16) return null
         val ids = listOf(me.id, peerId).sorted().joinToString("|")
-        return Crypto.hkdf(Crypto.agree(me.dhPriv, pub), ids.toByteArray(), "proximo-call".toByteArray())
+        return Crypto.hkdf(Crypto.agree(me.dhPriv, pub), callerSalt + calleeSalt, ("proximo-call|" + ids).toByteArray())
     }
 
     /** Paquet son : [1][dir][seq(4)][AES-GCM(iv = dir + salt(7) + seq(4), aad = seq)]. */
@@ -181,7 +188,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         val from = f.fromHex
         if (p.isNotEmpty() && p[0] == 1.toByte()) { // son
             val s = state.value
-            if (s.phase == CallState.ACTIVE && s.peerId == from && playQueue.size < 50) openAudio(p)?.let { playQueue.offer(it) }
+            if (s.phase == CallState.ACTIVE && s.peerId == from && playQueue.size < 50) openAudio(p)?.let { lastPacketAt = System.currentTimeMillis(); playQueue.offer(it) }
             return true
         }
         val j = try { JSONObject(String(p)) } catch (e: Exception) { return true }
@@ -197,16 +204,21 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                 val via = j.optString("via").ifEmpty { null }
                 // Le relais annoncé doit être celui par qui la trame est arrivée (sinon on répond en direct si possible).
                 val useVia = if (via != null && fromPeer == via) via else if (core.hasWifiLink(from)) null else fromPeer
-                salt = try { B64.dec(j.optString("salt")) } catch (e: Exception) { ByteArray(7) }
-                if (salt.size != 7) salt = ByteArray(7)
+                salt = try { B64.dec(j.optString("salt")) } catch (e: Exception) { ByteArray(0) }
+                peerSalt = try { B64.dec(j.optString("ks")) } catch (e: Exception) { ByteArray(0) }
+                // Invitation sans aléa valide (ancienne version ou trame abîmée) : refusée, jamais de clé prévisible.
+                if (salt.size != 7 || peerSalt.size != 16 || contactKey(from) == null) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
                 sendDir = 2; seq = 0; lastRecvSeq = -1
-                key = deriveKey(from)
-                if (key == null) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
+                key = null
                 val viaName = useVia?.let { db.contact(it)?.name ?: core.peer(it)?.name }
                 state.value = CallState(CallState.RINGING_IN, from, name, System.currentTimeMillis(), via = useVia, viaName = viaName)
                 ring(); notifyIncoming(name)
             }
-            "accept" -> if (s.phase == CallState.RINGING_OUT && s.peerId == from) startAudio(s)
+            "accept" -> if (s.phase == CallState.RINGING_OUT && s.peerId == from) {
+                peerSalt = try { B64.dec(j.optString("ks")) } catch (e: Exception) { ByteArray(0) }
+                key = deriveKey(from, mySalt, peerSalt)
+                if (key == null) { hangup(); MeshService.instance?.messenger?.event("Appel impossible : version incompatible") } else startAudio(s)
+            }
             "reject", "busy" -> if (s.peerId == from) { endCall(); MeshService.instance?.messenger?.event(if (c == "busy") "Occupé" else "Appel refusé") }
             "hangup" -> if (s.peerId == from) endCall()
         }
@@ -216,6 +228,8 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     private fun startAudio(s: CallState) {
         state.value = s.copy(phase = CallState.ACTIVE, since = System.currentTimeMillis())
         NotificationManagerCompat.from(ctx).cancel(NOTIF)
+        lastPacketAt = System.currentTimeMillis()
+        watchdog()
         try {
             audio.mode = AudioManager.MODE_IN_COMMUNICATION
             audio.isSpeakerphoneOn = s.speaker
@@ -250,6 +264,15 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                 }
             }.start()
         } catch (e: Exception) { Log.e(tag, "audio", e); hangup() }
+    }
+
+    /** Plus aucun paquet depuis 10 s : la liaison est perdue, on raccroche proprement. */
+    private fun watchdog() {
+        handler.postDelayed({
+            if (state.value.phase != CallState.ACTIVE) return@postDelayed
+            if (System.currentTimeMillis() - lastPacketAt > 10_000) { hangup(); MeshService.instance?.messenger?.event("Liaison perdue : appel terminé. Le talkie-walkie reste disponible.") }
+            else watchdog()
+        }, 2000)
     }
 
     private fun endCall() {

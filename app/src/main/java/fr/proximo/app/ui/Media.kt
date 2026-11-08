@@ -40,14 +40,14 @@ object Photos {
 
 /** Vidéos courtes : lecture du fichier, durée, vignette. Pas de recompression (on filme directement en basse qualité). */
 object Videos {
-    const val MAX_BYTES = 4_000_000L
+    const val MAX_BYTES = 3_500_000L
     const val MAX_SECONDS = 15
 
     /** Rend (données, secondes) ou null (trop lourde / illisible), avec le message d'erreur. */
     fun load(ctx: Context, uri: Uri): Pair<Pair<ByteArray, Int>?, String?> {
         return try {
             val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null to "Vidéo illisible"
-            if (bytes.size > MAX_BYTES) return null to "Vidéo trop lourde (${bytes.size / 1_000_000} Mo, maximum 4 Mo) : filme-la depuis Proximo, 15 s en basse qualité"
+            if (bytes.size > MAX_BYTES) return null to "Vidéo trop lourde (${bytes.size / 1_000_000} Mo, maximum 3,5 Mo) : filme-la depuis Proximo, 15 s en basse qualité"
             val r = android.media.MediaMetadataRetriever()
             r.setDataSource(ctx, uri)
             val ms = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
@@ -56,10 +56,16 @@ object Videos {
         } catch (e: Exception) { null to "Vidéo illisible" }
     }
 
-    fun thumbnail(path: String): Bitmap? = try {
-        if (Build.VERSION.SDK_INT >= 29) android.media.ThumbnailUtils.createVideoThumbnail(File(path), android.util.Size(480, 480), null)
-        else android.media.ThumbnailUtils.createVideoThumbnail(path, android.provider.MediaStore.Video.Thumbnails.MINI_KIND)
-    } catch (e: Exception) { null }
+    private val thumbs = android.util.LruCache<String, Bitmap>(24)
+    fun thumbnail(path: String): Bitmap? {
+        thumbs.get(path)?.let { return it }
+        val b = try {
+            if (Build.VERSION.SDK_INT >= 29) android.media.ThumbnailUtils.createVideoThumbnail(File(path), android.util.Size(480, 480), null)
+            else android.media.ThumbnailUtils.createVideoThumbnail(path, android.provider.MediaStore.Video.Thumbnails.MINI_KIND)
+        } catch (e: Exception) { null }
+        if (b != null) thumbs.put(path, b)
+        return b
+    }
 }
 
 /** Enregistrement d'un vocal (talkie-walkie) en AAC, petit débit. */

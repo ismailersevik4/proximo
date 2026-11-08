@@ -46,7 +46,7 @@ class Frame(
     companion object {
         const val VERSION = 1
         const val HEADER = 2 + 1 + 1 + 1 + 1 + 1 + 16 + 8 + 8 + 4
-        const val MAX_PAYLOAD = 4_000_000
+        const val MAX_PAYLOAD = 4_500_000
         const val DEFAULT_TTL = 7
 
         // Types de trames

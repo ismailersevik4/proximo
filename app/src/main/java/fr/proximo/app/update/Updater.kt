@@ -43,6 +43,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     /** 0..100 pendant un téléchargement, -1 sinon. */
     val progress = MutableStateFlow(-1)
     val message = MutableStateFlow<String?>(null)
+    /** Une APK est prête mais Android n'autorise pas encore Proximo à installer : le bandeau propose « Autoriser ». */
+    val needsInstallPermission = MutableStateFlow(false)
 
     private val myCode = BuildConfig.VERSION_CODE
     private var receiving: RandomAccessFile? = null
@@ -110,14 +112,22 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
             notifyReady()
             return
         }
-        if (!canInstall()) { message.value = "Autorise Proximo à installer des mises à jour (réglage Android), puis réessaie"; pendingInstall = f; askInstallPermission(); return }
+        if (!canInstall()) { pendingInstall = f; needsInstallPermission.value = true; return }
+        needsInstallPermission.value = false
         val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
         val i = Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
         ctx.startActivity(i)
     }
     private var pendingInstall: File? = null
-    fun retryPendingInstall() { pendingInstall?.let { if (fr.proximo.app.MainActivity.isForeground) { pendingInstall = null; install(it) } } }
+    fun retryPendingInstall() {
+        val f = pendingInstall ?: return
+        if (!fr.proximo.app.MainActivity.isForeground) return
+        if (canInstall()) { pendingInstall = null; needsInstallPermission.value = false; install(f) }
+        else needsInstallPermission.value = true
+    }
+    /** L'utilisateur a appuyé sur « Autoriser » : on ouvre le réglage Android une seule fois, à sa demande. */
+    fun requestInstallPermission() { try { askInstallPermission() } catch (e: Exception) { message.value = "Impossible d'ouvrir le réglage : ${e.message}" } }
 
     private fun notifyReady() {
         try {
@@ -205,7 +215,7 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
                 var tries = 0
                 while (!core.sendTo(peerId, Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), payload).encode()) && tries++ < 20) Thread.sleep(500)
                 if (tries >= 20) { Log.w(tag, "envoi APK interrompu"); return@launch }
-                if (i % 8 == 7) Thread.sleep(50)
+                Thread.sleep(20)
             }
             Log.i(tag, "APK envoyée à $peerId")
         } catch (e: Exception) { Log.w(tag, "envoi APK", e) }
@@ -218,6 +228,7 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
         if (total <= 0 || idx < 0 || idx >= total || size <= 0 || size > 200_000_000 || idx.toLong() * PART + data.size > size) return
         lastPartAt = System.currentTimeMillis()
         if (receiving == null || receivingCode != code) {
+            try { receiving?.close() } catch (_: Exception) {}
             receivingFile?.delete()
             val f = File(ctx.cacheDir, "Proximo-voisin.apk")
             receiving = RandomAccessFile(f, "rw").also { it.setLength(size.toLong()) }

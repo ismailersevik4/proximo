@@ -54,10 +54,10 @@ class MeshService : Service() {
         core.onLinkUp = { p -> messenger.onPeerAppeared(p); updater.onPeerAppeared(p) }
         core.setMode(Settings.get(this).mode)
         core.start()
-        registerReceiver(radioReceiver, IntentFilter().apply {
+        ContextCompat.registerReceiver(this, radioReceiver, IntentFilter().apply {
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             addAction(WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED)
-        })
+        }, ContextCompat.RECEIVER_NOT_EXPORTED)
         running.value = this
     }
 

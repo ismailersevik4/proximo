@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Groups
@@ -126,7 +127,7 @@ fun AppRoot(activity: MainActivity) {
 @Composable
 fun Onboarding(onDone: (String) -> Unit) {
     var name by remember { mutableStateOf("") }
-    Column(Modifier.fillMaxSize().background(Px.Bg).padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+    Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Logo(120.dp)
         Spacer(Modifier.height(20.dp))
         Text("Proximo", color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
@@ -144,7 +145,7 @@ fun Onboarding(onDone: (String) -> Unit) {
 
 @Composable
 fun PermissionsScreen(onAsk: () -> Unit, deniedOnce: Boolean, onSettings: () -> Unit) {
-    Column(Modifier.fillMaxSize().background(Px.Bg).padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+    Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Logo(90.dp)
         Spacer(Modifier.height(24.dp))
         Text("Autorisations nécessaires", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
