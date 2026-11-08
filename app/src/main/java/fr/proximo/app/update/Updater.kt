@@ -114,16 +114,18 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     fun retryPendingInstall() { pendingInstall?.let { if (canInstall()) { pendingInstall = null; install(it) } } }
 
     @Suppress("DEPRECATION")
-    private fun sameSignature(apk: File): Boolean = try {
-        val pm = ctx.packageManager
-        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
-        val info = pm.getPackageArchiveInfo(apk.absolutePath, flags) ?: return false
-        if (info.packageName != ctx.packageName) return false
-        val mine = pm.getPackageInfo(ctx.packageName, flags)
-        val a = if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else info.signatures
-        val b = if (Build.VERSION.SDK_INT >= 28) mine.signingInfo?.apkContentsSigners else mine.signatures
-        a != null && b != null && a.isNotEmpty() && a.first().toCharsString() == b.first().toCharsString()
-    } catch (e: Exception) { Log.w(tag, "signature", e); false }
+    private fun sameSignature(apk: File): Boolean {
+        return try {
+            val pm = ctx.packageManager
+            val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+            val info = pm.getPackageArchiveInfo(apk.absolutePath, flags) ?: return false
+            if (info.packageName != ctx.packageName) return false
+            val mine = pm.getPackageInfo(ctx.packageName, flags)
+            val a = if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else info.signatures
+            val b = if (Build.VERSION.SDK_INT >= 28) mine.signingInfo?.apkContentsSigners else mine.signatures
+            a != null && b != null && a.isNotEmpty() && a.first().toCharsString() == b.first().toCharsString()
+        } catch (e: Exception) { Log.w(tag, "signature", e); false }
+    }
 
     // ---------------- de téléphone à téléphone ----------------
     /** Dès qu'un voisin apparaît, on lui dit quelle version on a (il demandera l'APK s'il est en retard). */
