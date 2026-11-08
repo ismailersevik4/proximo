@@ -64,6 +64,10 @@ fun SettingsScreen(onBack: () -> Unit) {
                     Column(Modifier.weight(1f)) { Text("Version installée", color = Color.White); Text("Appli ${BuildConfig.VERSION_NAME} · APK ${BuildConfig.VERSION_CODE}", color = Px.Muted, fontSize = 12.sp) }
                     TextButton(onClick = { svc?.updater?.checkOnline(); svc?.messenger?.event("Vérification en cours…") }) { Text("Vérifier") }
                 }
+                Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) { Text("Chercher une mise à jour chez les voisins", color = Color.White); Text("Demande aux téléphones à portée s'ils ont une version plus récente (Wi-Fi direct ou Bluetooth).", color = Px.Muted, fontSize = 12.sp) }
+                    TextButton(onClick = { val n = svc?.updater?.askPeers() ?: 0; svc?.messenger?.event(if (n == 0) "Aucun téléphone connecté pour l'instant" else "Demande envoyée à $n téléphone(s)…") }) { Text("Chercher") }
+                }
             }
             Spacer(Modifier.height(14.dp))
             Section("Réseau") {

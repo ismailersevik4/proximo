@@ -60,6 +60,7 @@ class MeshService : Service() {
         core.onLinkUp = { p -> messenger.onPeerAppeared(p); updater.onPeerAppeared(p) }
         core.setMode(Settings.get(this).mode)
         core.start()
+        updater.startPeriodicOffers()
         // Garde le processeur éveillé pour le Bluetooth quand l'écran est éteint (les vieux téléphones coupent sinon).
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager

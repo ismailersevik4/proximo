@@ -49,13 +49,15 @@ import kotlinx.coroutines.delay
 fun UpdateBanner(modifier: Modifier) {
     val svc by serviceState()
     val up = svc?.updater ?: return
-    val info by up.available.collectAsState()
+    val online by up.available.collectAsState()
+    val peerInfo by up.peerOffer.collectAsState()
+    val info = peerInfo ?: online
     val progress by up.progress.collectAsState()
     val msg by up.message.collectAsState()
     val needPerm by up.needsInstallPermission.collectAsState()
     val bleAsk by up.bleConfirm.collectAsState()
     val tr by up.transfer.collectAsState()
-    if (info == null && progress < 0 && msg == null && !needPerm && bleAsk == null && tr == null) return
+    if (online == null && peerInfo == null && progress < 0 && msg == null && !needPerm && bleAsk == null && tr == null) return
     Column(modifier.fillMaxWidth().padding(12.dp).background(Px.Card, RoundedCornerShape(14.dp)).padding(14.dp)) {
         val t = tr
         if (t != null) {
@@ -74,12 +76,14 @@ fun UpdateBanner(modifier: Modifier) {
             Text("Mise à jour en cours… $progress %", color = Color.White, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp)); LinearProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth(), color = Px.Accent, trackColor = Px.Card2)
         } else if (info != null) {
-            val i = info!!
-            Text(if (i.fromPeer != null) "${i.peerName ?: "Un voisin"} a Proximo ${i.name}" else "Mise à jour ${i.name} disponible", color = Color.White, fontWeight = FontWeight.Bold)
-            Text(if (i.fromPeer != null) "Récupérer la nouvelle version depuis son téléphone (environ 15 Mo, Wi-Fi direct ou Bluetooth) ? Tes contacts et messages sont conservés." else "Télécharger et installer la nouvelle version ? Tes contacts et messages sont conservés.", color = Px.Muted, fontSize = 13.sp)
+            val i = info
+            val p = peerInfo; val o = online
+            Text(when { p != null && o != null -> "Mise à jour ${i.name} disponible"; p != null -> "${p.peerName ?: "Un voisin"} a Proximo ${p.name}"; else -> "Mise à jour ${i.name} disponible" }, color = Color.White, fontWeight = FontWeight.Bold)
+            Text(when { p != null && o != null -> "Par Internet, ou depuis le téléphone de ${p.peerName ?: "un voisin"} (Wi-Fi direct ou Bluetooth). Tes contacts et messages sont conservés."; p != null -> "Récupérer la nouvelle version depuis son téléphone (environ 15 Mo, Wi-Fi direct ou Bluetooth) ? Tes contacts et messages sont conservés."; else -> "Télécharger et installer la nouvelle version ? Tes contacts et messages sont conservés." }, color = Px.Muted, fontSize = 13.sp)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 TextButton(onClick = { up.dismiss() }) { Text("Plus tard", color = Px.Muted) }
-                TextButton(onClick = { if (i.fromPeer != null) up.requestFromPeer(i.fromPeer) else up.downloadAndInstall(); up.available.value = null }) { Text("Installer", fontWeight = FontWeight.Bold) }
+                if (o != null) TextButton(onClick = { up.downloadAndInstall(); up.available.value = null; up.peerOffer.value = null }) { Text(if (p != null) "Par Internet" else "Installer", fontWeight = FontWeight.Bold) }
+                if (p != null) TextButton(onClick = { up.requestFromPeer(p.fromPeer!!); up.available.value = null; up.peerOffer.value = null }) { Text(if (o != null) "Depuis ${p.peerName ?: "le voisin"}" else "Installer", fontWeight = FontWeight.Bold) }
             }
         }
         if (needPerm) {

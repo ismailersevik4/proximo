@@ -46,6 +46,9 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val available = MutableStateFlow<UpdateInfo?>(null)
+    /** Offre d'un voisin, gardée à côté de l'offre Internet (le bandeau propose les deux). */
+    val peerOffer = MutableStateFlow<UpdateInfo?>(null)
+    private val lastOfferTo = ConcurrentHashMap<String, Long>()
     /** Pourcentage du téléchargement ou de la réception en cours, -1 sinon. */
     val progress = MutableStateFlow(-1)
     /** Détail du transfert en cours (réception ou envoi), null sinon. */
@@ -176,16 +179,34 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
 
     // ---------------- de téléphone à téléphone ----------------
     /** Dès qu'une liaison s'ouvre, on dit au voisin quelle version on a (il demandera l'APK s'il est en retard). */
-    fun onPeerAppeared(p: Peer) {
+    fun onPeerAppeared(p: Peer) { offerTo(p.id, force = true) }
+
+    private fun offerTo(peerId: String, force: Boolean) {
         if (!settings.shareUpdates) return
+        val now = System.currentTimeMillis()
+        if (!force && now - (lastOfferTo[peerId] ?: 0L) < 10 * 60_000) return
         val j = JSONObject().put("c", "offer").put("v", myCode).put("n", BuildConfig.VERSION_NAME).toString()
-        core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(p.id), j.toByteArray()))
+        if (core.sendTo(peerId, Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), j.toByteArray()).encode())) lastOfferTo[peerId] = now
+    }
+
+    /** Toutes les 10 minutes, on rappelle notre version aux voisins connectés (au cas où l'offre à l'ouverture se soit perdue). */
+    fun startPeriodicOffers() = scope.launch {
+        while (true) { delay(60_000); for (id in core.connectedPeerIds()) offerTo(id, force = false) }
+    }
+
+    /** Bouton « Chercher une mise à jour chez les voisins » : on interroge tout le monde ; les réponses arrivent en « offer ». */
+    fun askPeers(): Int {
+        val ids = core.connectedPeerIds()
+        peerOffer.value = null
+        settings.lastOfferedVersion = 0
+        for (id in ids) core.sendTo(id, Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(id), JSONObject().put("c", "ask").put("v", myCode).toString().toByteArray()).encode())
+        return ids.size
     }
 
     /** L'utilisateur accepte de récupérer la version du voisin. Sans Wi-Fi direct, on demande confirmation pour le Bluetooth. */
     fun requestFromPeer(peerId: String, allowBle: Boolean = false) {
         val wifi = core.hasWifiLink(peerId)
-        if (!wifi && !allowBle) { bleConfirm.value = available.value ?: UpdateInfo(0, "", peerId, core.peer(peerId)?.name); return }
+        if (!wifi && !allowBle) { bleConfirm.value = peerOffer.value ?: available.value ?: UpdateInfo(0, "", peerId, core.peer(peerId)?.name); return }
         bleConfirm.value = null
         if (!wifi && !core.connectedPeerIds().contains(peerId)) { message.value = "Ce voisin n'est pas joignable pour l'instant."; return }
         val have = JSONArray(); if (receivingFrom == peerId && receiving != null) receivedParts.forEach { have.put(it) }
@@ -220,10 +241,11 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
                 "offer" -> {
                     val v = j.optInt("v")
                     val refusedRecently = v == settings.lastOfferedVersion && System.currentTimeMillis() - settings.lastOfferedAt < 24 * 3600_000L
-                    if (v > myCode && !refusedRecently && available.value == null && progress.value < 0) {
-                        available.value = UpdateInfo(v, j.optString("n"), f.fromHex, core.peer(f.fromHex)?.name)
+                    if (v > myCode && !refusedRecently && progress.value < 0 && (peerOffer.value == null || peerOffer.value!!.code < v)) {
+                        peerOffer.value = UpdateInfo(v, j.optString("n"), f.fromHex, core.peer(f.fromHex)?.name)
                     }
                 }
+                "ask" -> if (j.optInt("v") < myCode) offerTo(f.fromHex, force = true)
                 "req" -> if (j.optInt("v") < myCode && settings.shareUpdates) {
                     val have = HashSet<Int>(); j.optJSONArray("have")?.let { a -> for (i in 0 until a.length()) have.add(a.getInt(i)) }
                     sendApk(f.fromHex, j.optBoolean("ble", false), have)
@@ -310,8 +332,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     }
 
     fun dismiss() {
-        available.value?.let { settings.lastOfferedVersion = it.code; settings.lastOfferedAt = System.currentTimeMillis() }
-        available.value = null; message.value = null; bleConfirm.value = null
+        (peerOffer.value ?: available.value)?.let { settings.lastOfferedVersion = it.code; settings.lastOfferedAt = System.currentTimeMillis() }
+        available.value = null; peerOffer.value = null; message.value = null; bleConfirm.value = null
     }
 
     companion object {
