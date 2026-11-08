@@ -17,21 +17,27 @@ import fr.proximo.app.mesh.Peer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 
 /** Une mise à jour disponible, par Internet ou depuis un voisin. */
 data class UpdateInfo(val code: Int, val name: String, val fromPeer: String?, val peerName: String?)
 
+/** Transfert en cours (réception ou envoi) pour l'écran : pourcentage, texte, Bluetooth ou Wi-Fi. */
+data class Transfer(val percent: Int, val label: String, val ble: Boolean)
+
 /**
  * Mises à jour de l'appli :
- *  - par Internet : fichier proximo-apk.json et Proximo.apk dans les « Releases » GitHub (tag android) ;
- *  - de téléphone à téléphone : un voisin qui a une version plus récente envoie l'APK par Wi-Fi direct.
+ *  - par Internet : proximo-apk.json et Proximo.apk dans les « Releases » GitHub (tag android) ;
+ *  - de téléphone à téléphone : par Wi-Fi direct (rapide), ou en secours par Bluetooth (lent, morceau par morceau avec reprise).
  * Dans les deux cas, Android vérifie que l'APK est signée avec la même clé avant d'installer.
  */
 class Updater(private val ctx: Context, private val core: MeshCore) {
@@ -40,18 +46,32 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     val available = MutableStateFlow<UpdateInfo?>(null)
-    /** 0..100 pendant un téléchargement, -1 sinon. */
+    /** Pourcentage du téléchargement ou de la réception en cours, -1 sinon. */
     val progress = MutableStateFlow(-1)
+    /** Détail du transfert en cours (réception ou envoi), null sinon. */
+    val transfer = MutableStateFlow<Transfer?>(null)
     val message = MutableStateFlow<String?>(null)
     /** Une APK est prête mais Android n'autorise pas encore Proximo à installer : le bandeau propose « Autoriser ». */
     val needsInstallPermission = MutableStateFlow(false)
+    /** Le voisin n'a pas de Wi-Fi direct : demande de confirmation pour passer en Bluetooth (lent). */
+    val bleConfirm = MutableStateFlow<UpdateInfo?>(null)
 
     private val myCode = BuildConfig.VERSION_CODE
+
+    // Réception
     private var receiving: RandomAccessFile? = null
     private var receivingFile: File? = null
     private var receivingTotal = 0
     private var receivedParts = HashSet<Int>()
     private var receivingCode = 0
+    private var receivingFrom: String? = null
+    private var receivingBle = false
+    @Volatile private var lastPartAt = 0L
+    private var receiveStart = 0L
+
+    // Envoi : accusés « got » par voisin
+    private val gotAcks = ConcurrentHashMap<String, Int>()
+    @Volatile private var sendingTo: String? = null
 
     // ---------------- Internet ----------------
     fun checkOnline() = scope.launch {
@@ -75,18 +95,18 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     fun downloadAndInstall() = scope.launch {
         val url = onlineApkUrl ?: return@launch
         try {
-            progress.value = 0
+            progress.value = 0; transfer.value = Transfer(0, "Téléchargement par Internet…", false)
             val f = File(ctx.cacheDir, "Proximo-maj.apk")
             val c = URL(url).openConnection() as HttpURLConnection
             c.instanceFollowRedirects = true; c.connectTimeout = 15000; c.readTimeout = 30000
             val total = c.contentLength
             c.inputStream.use { inp -> f.outputStream().use { out ->
                 val buf = ByteArray(65536); var n: Int; var done = 0L
-                while (inp.read(buf).also { n = it } > 0) { out.write(buf, 0, n); done += n; if (total > 0) progress.value = (done * 100 / total).toInt() }
+                while (inp.read(buf).also { n = it } > 0) { out.write(buf, 0, n); done += n; if (total > 0) { val pc = (done * 100 / total).toInt(); progress.value = pc; transfer.value = Transfer(pc, "Téléchargement par Internet…", false) } }
             } }
-            progress.value = -1
+            progress.value = -1; transfer.value = null
             install(f)
-        } catch (e: Exception) { progress.value = -1; message.value = "Téléchargement impossible : ${e.message}" }
+        } catch (e: Exception) { progress.value = -1; transfer.value = null; message.value = "Téléchargement impossible : ${e.message}" }
     }
 
     private fun get(url: String): String {
@@ -155,28 +175,37 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     }
 
     // ---------------- de téléphone à téléphone ----------------
-    /** Dès qu'un voisin apparaît, on lui dit quelle version on a (il demandera l'APK s'il est en retard). */
+    /** Dès qu'une liaison s'ouvre, on dit au voisin quelle version on a (il demandera l'APK s'il est en retard). */
     fun onPeerAppeared(p: Peer) {
         if (!settings.shareUpdates) return
         val j = JSONObject().put("c", "offer").put("v", myCode).put("n", BuildConfig.VERSION_NAME).toString()
         core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(p.id), j.toByteArray()))
     }
 
-    /** L'utilisateur accepte de récupérer la version du voisin. */
-    fun requestFromPeer(peerId: String) {
-        if (!core.hasWifiLink(peerId)) { message.value = "Ce voisin n'est pas joignable en Wi-Fi direct : la mise à jour ne peut pas passer en Bluetooth (trop lent)."; return }
-        val j = JSONObject().put("c", "req").put("v", myCode).toString()
+    /** L'utilisateur accepte de récupérer la version du voisin. Sans Wi-Fi direct, on demande confirmation pour le Bluetooth. */
+    fun requestFromPeer(peerId: String, allowBle: Boolean = false) {
+        val wifi = core.hasWifiLink(peerId)
+        if (!wifi && !allowBle) { bleConfirm.value = available.value ?: UpdateInfo(0, "", peerId, core.peer(peerId)?.name); return }
+        bleConfirm.value = null
+        if (!wifi && !core.connectedPeerIds().contains(peerId)) { message.value = "Ce voisin n'est pas joignable pour l'instant."; return }
+        val have = JSONArray(); if (receivingFrom == peerId && receiving != null) receivedParts.forEach { have.put(it) }
+        val j = JSONObject().put("c", "req").put("v", myCode).put("ble", !wifi).put("have", have).toString()
         core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), j.toByteArray()))
-        progress.value = 0
-        lastPartAt = System.currentTimeMillis()
+        receivingBle = !wifi; receivingFrom = peerId
+        progress.value = 0; transfer.value = Transfer(0, if (wifi) "Réception par Wi-Fi direct…" else "Réception par Bluetooth (lent)…", !wifi)
+        lastPartAt = System.currentTimeMillis(); receiveStart = lastPartAt
         scope.launch {
+            val timeout = if (wifi) 60_000 else 180_000
             while (progress.value >= 0) {
-                kotlinx.coroutines.delay(5000)
-                if (progress.value >= 0 && System.currentTimeMillis() - lastPartAt > 60_000) { progress.value = -1; message.value = "La mise à jour n'arrive pas : le voisin n'est plus joignable en Wi-Fi direct."; break }
+                delay(5000)
+                if (progress.value >= 0 && System.currentTimeMillis() - lastPartAt > timeout) {
+                    progress.value = -1; transfer.value = null
+                    message.value = if (receivedParts.isEmpty()) "La mise à jour n'arrive pas : le voisin n'est plus joignable." else "Transfert interrompu à ${receivedParts.size * 100 / maxOf(1, receivingTotal)} % : il reprendra là où il en était quand le voisin sera de nouveau à portée (appuie sur Installer)."
+                    break
+                }
             }
         }
     }
-    @Volatile private var lastPartAt = 0L
 
     /** Rend true si la trame était pour la mise à jour. */
     fun handle(f: Frame, fromPeer: String): Boolean {
@@ -195,30 +224,58 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
                         available.value = UpdateInfo(v, j.optString("n"), f.fromHex, core.peer(f.fromHex)?.name)
                     }
                 }
-                "req" -> if (j.optInt("v") < myCode && settings.shareUpdates) sendApk(f.fromHex)
+                "req" -> if (j.optInt("v") < myCode && settings.shareUpdates) {
+                    val have = HashSet<Int>(); j.optJSONArray("have")?.let { a -> for (i in 0 until a.length()) have.add(a.getInt(i)) }
+                    sendApk(f.fromHex, j.optBoolean("ble", false), have)
+                }
                 "part" -> onPart(j, p.copyOfRange(2 + len, p.size), f.fromHex)
+                "got" -> gotAcks[f.fromHex] = j.optInt("i")
+                "done" -> { if (sendingTo == f.fromHex) { sendingTo = null; transfer.value = null } }
             }
         } catch (e: Exception) { Log.w(tag, "trame maj", e) }
         return true
     }
 
-    private fun sendApk(peerId: String) = scope.launch {
-        if (!core.hasWifiLink(peerId)) { Log.i(tag, "APK : pas de prise Wi-Fi avec $peerId"); return@launch }
+    /** Envoi de mon APK, morceau par morceau, en attendant l'accusé du voisin pour chacun (les textes passent entre deux). */
+    private fun sendApk(peerId: String, ble: Boolean, have: Set<Int>) = scope.launch {
+        if (sendingTo != null) { Log.i(tag, "un envoi est déjà en cours"); return@launch }
+        if (!ble && !core.hasWifiLink(peerId)) { Log.i(tag, "APK : pas de prise Wi-Fi avec $peerId"); return@launch }
+        sendingTo = peerId
+        val who = core.peer(peerId)?.name ?: "un voisin"
         try {
             val src = File(ctx.applicationInfo.sourceDir)
             val data = src.readBytes()
             val total = (data.size + PART - 1) / PART
+            val flags = if (ble) Frame.FLAG_ALLOW_BLE else 0
+            val start = System.currentTimeMillis()
+            var sent = have.size
             for (i in 0 until total) {
-                val start = i * PART; val end = minOf(data.size, start + PART)
+                if (i in have) continue
+                if (sendingTo != peerId) break
+                val startB = i * PART; val end = minOf(data.size, startB + PART)
                 val j = JSONObject().put("c", "part").put("i", i).put("n", total).put("v", myCode).put("s", data.size).toString().toByteArray()
-                val payload = byteArrayOf((j.size shr 8).toByte(), j.size.toByte()) + j + data.copyOfRange(start, end)
-                var tries = 0
-                while (!core.sendTo(peerId, Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), payload).encode()) && tries++ < 20) Thread.sleep(500)
-                if (tries >= 20) { Log.w(tag, "envoi APK interrompu"); return@launch }
-                Thread.sleep(20)
+                val payload = byteArrayOf((j.size shr 8).toByte(), j.size.toByte()) + j + data.copyOfRange(startB, end)
+                var ok = false
+                for (attempt in 0 until 3) {
+                    gotAcks.remove(peerId)
+                    var tries = 0
+                    while (!core.sendTo(peerId, Frame(Frame.APK, 0, 0, flags, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), payload).encode()) && tries++ < 20) delay(500)
+                    if (tries >= 20) break
+                    // On attend l'accusé du morceau (Bluetooth : jusqu'à 40 s, Wi-Fi : 10 s).
+                    val deadline = System.currentTimeMillis() + if (ble) 40_000 else 10_000
+                    while (System.currentTimeMillis() < deadline) { if (gotAcks[peerId] == i) { ok = true; break }; delay(100) }
+                    if (ok) break
+                }
+                if (!ok) { Log.w(tag, "envoi APK interrompu au morceau $i"); transfer.value = null; sendingTo = null; return@launch }
+                sent++
+                val pc = sent * 100 / total
+                val elapsed = System.currentTimeMillis() - start
+                val eta = if (sent > have.size) elapsed / (sent - have.size) * (total - sent) / 1000 else 0L
+                transfer.value = Transfer(pc, "Envoi de la mise à jour à $who… ${if (ble) "Bluetooth" else "Wi-Fi direct"}" + if (eta > 5) " · ~${eta / 60} min ${eta % 60} s" else "", ble)
             }
             Log.i(tag, "APK envoyée à $peerId")
         } catch (e: Exception) { Log.w(tag, "envoi APK", e) }
+        finally { sendingTo = null; transfer.value = null }
     }
 
     @Synchronized
@@ -232,21 +289,29 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
             receivingFile?.delete()
             val f = File(ctx.cacheDir, "Proximo-voisin.apk")
             receiving = RandomAccessFile(f, "rw").also { it.setLength(size.toLong()) }
-            receivingFile = f; receivingTotal = total; receivedParts = HashSet(); receivingCode = code
+            receivingFile = f; receivingTotal = total; receivedParts = HashSet(); receivingCode = code; receivingFrom = from
+            if (receiveStart == 0L) receiveStart = System.currentTimeMillis()
         }
         receiving?.let { it.seek(idx.toLong() * PART); it.write(data) }
         receivedParts.add(idx)
-        progress.value = receivedParts.size * 100 / maxOf(1, total)
+        // Accusé au voisin : il peut envoyer le morceau suivant.
+        core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(from), JSONObject().put("c", "got").put("i", idx).toString().toByteArray()))
+        val pc = receivedParts.size * 100 / maxOf(1, total)
+        val elapsed = System.currentTimeMillis() - receiveStart
+        val eta = if (receivedParts.size > 0) elapsed / receivedParts.size * (total - receivedParts.size) / 1000 else 0L
+        progress.value = pc
+        transfer.value = Transfer(pc, (if (receivingBle) "Réception par Bluetooth (lent)…" else "Réception par Wi-Fi direct…") + if (eta > 5) " · ~${eta / 60} min ${eta % 60} s" else "", receivingBle)
         if (receivedParts.size == total) {
             receiving?.close(); receiving = null
-            progress.value = -1
+            progress.value = -1; transfer.value = null; receiveStart = 0L
+            core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(from), JSONObject().put("c", "done").toString().toByteArray()))
             receivingFile?.let { install(it) }
         }
     }
 
     fun dismiss() {
         available.value?.let { settings.lastOfferedVersion = it.code; settings.lastOfferedAt = System.currentTimeMillis() }
-        available.value = null; message.value = null
+        available.value = null; message.value = null; bleConfirm.value = null
     }
 
     companion object {

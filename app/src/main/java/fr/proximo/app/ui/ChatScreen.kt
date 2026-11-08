@@ -7,6 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -94,6 +95,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     var recording by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var sosDialog by remember { mutableStateOf(false) }
+    var clearDialog by remember { mutableStateOf(false) }
     val recorder = remember { VoiceRecorder(ctx) }
 
     val title = when { isAll -> "Tout le monde"; group != null -> group!!.name; else -> contact?.name ?: "Discussion" }
@@ -157,11 +159,12 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                 }
             }
             if (isAll) TextButton(onClick = { sosDialog = true }) { Text("SOS", color = Px.Danger, fontWeight = FontWeight.Bold) }
-            if (group != null) {
+            Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "Menu", tint = Color.White) }
                 DropdownMenu(menu, { menu = false }) {
-                    DropdownMenuItem(text = { Text("Membres : " + group!!.members.joinToString { m -> names[m] ?: if (m == svc?.core?.myId()) "moi" else "?" }) }, onClick = { menu = false })
-                    DropdownMenuItem(text = { Text("Quitter le groupe", color = Px.Danger) }, onClick = { menu = false; svc?.messenger?.leaveGroup(chat); onBack?.invoke() })
+                    if (group != null) DropdownMenuItem(text = { Text("Membres : " + group!!.members.joinToString { m -> names[m] ?: if (m == svc?.core?.myId()) "moi" else "?" }) }, onClick = { menu = false })
+                    DropdownMenuItem(text = { Text("Effacer la discussion") }, onClick = { menu = false; clearDialog = true })
+                    if (group != null) DropdownMenuItem(text = { Text("Quitter le groupe", color = Px.Danger) }, onClick = { menu = false; svc?.messenger?.leaveGroup(chat); onBack?.invoke() })
                 }
             }
         }
@@ -235,6 +238,16 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         }
     }
 
+    if (clearDialog) {
+        AlertDialog(
+            onDismissRequest = { clearDialog = false }, containerColor = Px.Card,
+            title = { Text("Effacer la discussion ?", color = Color.White) },
+            text = { Text(if (isAll) "Ton historique de « Tout le monde » sera vidé sur ce téléphone. Le canal reste, les prochains messages arriveront normalement." else "Les messages seront effacés de ce téléphone uniquement ; l'autre garde sa copie.", color = Px.Muted) },
+            confirmButton = { TextButton(onClick = { clearDialog = false; scope.launch(Dispatchers.IO) { db.clearChat(chat) } }) { Text("Effacer", color = Px.Danger) } },
+            dismissButton = { TextButton(onClick = { clearDialog = false }) { Text("Annuler", color = Px.Muted) } },
+        )
+    }
+
     if (sosDialog) {
         var sosText by remember { mutableStateOf("Besoin d'aide !") }
         AlertDialog(
@@ -263,6 +276,7 @@ private fun DaySeparator(day: String) {
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> String?) {
     val ctx = LocalContext.current
@@ -270,8 +284,17 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
     val isSos = m.kind == Message.SOS
     val bg = when { isSos -> Px.Danger.copy(alpha = 0.25f); m.mine -> Px.AccentDark; else -> Px.Card2 }
     val shape = if (m.mine) RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp) else RoundedCornerShape(18.dp, 18.dp, 18.dp, 4.dp)
+    var menu by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxWidth().padding(vertical = 3.dp), contentAlignment = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart) {
-        Column(Modifier.widthIn(max = 300.dp).background(bg, shape).padding(12.dp, 8.dp)) {
+        DropdownMenu(menu, { menu = false }) {
+            if (m.kind == Message.TEXT) DropdownMenuItem(text = { Text("Copier le texte") }, onClick = {
+                menu = false
+                (ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("Proximo", m.body))
+                MeshService.instance?.messenger?.event("Texte copié")
+            })
+            DropdownMenuItem(text = { Text("Supprimer", color = Px.Danger) }, onClick = { menu = false; Thread { Db.get(ctx).deleteMessage(m.mid) }.start() })
+        }
+        Column(Modifier.widthIn(max = 300.dp).background(bg, shape).combinedClickable(onClick = {}, onLongClick = { menu = true }).padding(12.dp, 8.dp)) {
             if (showName && !m.mine) Text(contactName(m.from) ?: m.senderName.ifEmpty { "Inconnu" }, color = Px.Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             when (m.kind) {
                 Message.PHOTO -> m.file?.let { AsyncImage(File(it), "Photo", modifier = Modifier.fillMaxWidth().height(200.dp).background(Px.Card, RoundedCornerShape(12.dp)).clickable {

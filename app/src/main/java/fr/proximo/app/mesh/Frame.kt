@@ -68,6 +68,8 @@ class Frame(
         val DIRECT_ONLY = setOf(HELLO, CARD_REQ, CARD, CALL, APK, PING, AVATAR)
         /** Drapeau : ne passer que par une prise Wi-Fi direct (vidéos, gros fichiers). */
         const val FLAG_WIFI_ONLY = 1
+        /** Drapeau : morceau de mise à jour autorisé à passer en Bluetooth (secours, lent). */
+        const val FLAG_ALLOW_BLE = 2
         val BROADCAST = ByteArray(8)
 
         fun newId(): ByteArray = Crypto.random(16)

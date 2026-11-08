@@ -219,7 +219,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val type = if (data.size > 3) data[3].toInt() and 0xff else 0
         val flags = if (data.size > 6) data[6].toInt() and 0xff else 0
         // Appels, morceaux d'APK et trames marquées « Wi-Fi seulement » (vidéos) : uniquement par la prise Wi-Fi.
-        if (type == Frame.CALL || type == Frame.APK || (flags and Frame.FLAG_WIFI_ONLY) != 0) {
+        val apkBle = type == Frame.APK && (flags and Frame.FLAG_ALLOW_BLE) != 0
+        if (!apkBle && (type == Frame.CALL || type == Frame.APK || (flags and Frame.FLAG_WIFI_ONLY) != 0)) {
             val t = transports.firstOrNull { it.name == Modes.WIFI } ?: return false
             return t.hasFastLink(peerId) && t.send(peerId, data)
         }
@@ -238,6 +239,9 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         for (o in entries) try {
             // Ce qui n'est pas à moi n'est gardé qu'une heure ; le mien trois jours (purge).
             if (!o.mine && now - o.created > 3600_000) { db.removeOutbox(o.fid); continue }
+            // « Tout le monde » (hors SOS) : canal en direct, les messages ne sont pas gardés plus de 5 minutes pour les retardataires.
+            val otype = if (o.data.size > 3) o.data[3].toInt() and 0xff else 0
+            if (otype == Frame.PUBLIC && now - o.created > 5 * 60_000) { db.removeOutbox(o.fid); if (o.mine) db.failIfPending(o.fid); continue }
             val isDirect = o.dest != Hex.enc(Frame.BROADCAST)
             var changed = false
             for (p in connected) {

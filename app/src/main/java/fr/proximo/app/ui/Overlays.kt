@@ -53,15 +53,30 @@ fun UpdateBanner(modifier: Modifier) {
     val progress by up.progress.collectAsState()
     val msg by up.message.collectAsState()
     val needPerm by up.needsInstallPermission.collectAsState()
-    if (info == null && progress < 0 && msg == null && !needPerm) return
+    val bleAsk by up.bleConfirm.collectAsState()
+    val tr by up.transfer.collectAsState()
+    if (info == null && progress < 0 && msg == null && !needPerm && bleAsk == null && tr == null) return
     Column(modifier.fillMaxWidth().padding(12.dp).background(Px.Card, RoundedCornerShape(14.dp)).padding(14.dp)) {
-        if (progress >= 0) {
+        val t = tr
+        if (t != null) {
+            Text(if (progress >= 0) "Mise à jour en cours… ${t.percent} %" else "Envoi en cours… ${t.percent} %", color = Color.White, fontWeight = FontWeight.Bold)
+            Text(t.label + if (t.ble) " · garde les téléphones côte à côte, écran allumé" else "", color = Px.Muted, fontSize = 12.sp)
+            Spacer(Modifier.height(8.dp)); LinearProgressIndicator(progress = { t.percent / 100f }, modifier = Modifier.fillMaxWidth(), color = Px.Accent, trackColor = Px.Card2)
+        } else if (bleAsk != null) {
+            val b = bleAsk!!
+            Text("Pas de Wi-Fi direct avec ${b.peerName ?: "ce voisin"}", color = Color.White, fontWeight = FontWeight.Bold)
+            Text("La mise à jour peut passer en Bluetooth, mais c'est lent : environ 10 minutes pour 15 Mo. Garde les deux téléphones côte à côte, écran allumé. Si ça coupe, ça reprendra là où ça s'est arrêté.", color = Px.Muted, fontSize = 13.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { up.bleConfirm.value = null }) { Text("Annuler", color = Px.Muted) }
+                TextButton(onClick = { b.fromPeer?.let { up.requestFromPeer(it, allowBle = true) } }) { Text("Continuer en Bluetooth", fontWeight = FontWeight.Bold) }
+            }
+        } else if (progress >= 0) {
             Text("Mise à jour en cours… $progress %", color = Color.White, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp)); LinearProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth(), color = Px.Accent, trackColor = Px.Card2)
         } else if (info != null) {
             val i = info!!
             Text(if (i.fromPeer != null) "${i.peerName ?: "Un voisin"} a Proximo ${i.name}" else "Mise à jour ${i.name} disponible", color = Color.White, fontWeight = FontWeight.Bold)
-            Text(if (i.fromPeer != null) "Récupérer la nouvelle version depuis son téléphone par Wi-Fi direct (environ 15 Mo) ? Tes contacts et messages sont conservés." else "Télécharger et installer la nouvelle version ? Tes contacts et messages sont conservés.", color = Px.Muted, fontSize = 13.sp)
+            Text(if (i.fromPeer != null) "Récupérer la nouvelle version depuis son téléphone (environ 15 Mo, Wi-Fi direct ou Bluetooth) ? Tes contacts et messages sont conservés." else "Télécharger et installer la nouvelle version ? Tes contacts et messages sont conservés.", color = Px.Muted, fontSize = 13.sp)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 TextButton(onClick = { up.dismiss() }) { Text("Plus tard", color = Px.Muted) }
                 TextButton(onClick = { if (i.fromPeer != null) up.requestFromPeer(i.fromPeer) else up.downloadAndInstall(); up.available.value = null }) { Text("Installer", fontWeight = FontWeight.Bold) }

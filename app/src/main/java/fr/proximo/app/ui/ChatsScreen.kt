@@ -2,6 +2,7 @@ package fr.proximo.app.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,6 +42,9 @@ fun ChatsScreen(onOpen: (String) -> Unit, onNewGroup: () -> Unit, onAdd: () -> U
     val chats by dbState(emptyList<ChatSummary>()) { it.chatSummaries() }
     val peers by peersState()
     val pendingIn by dbState(0) { it.contacts().count { c -> c.status == 2 } }
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val svc by serviceState()
+    var target by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<ChatSummary?>(null) }
 
     Column(Modifier.fillMaxSize().background(Px.Bg)) {
         Row(Modifier.fillMaxWidth().padding(20.dp, 16.dp, 12.dp, 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -57,20 +61,41 @@ fun ChatsScreen(onOpen: (String) -> Unit, onNewGroup: () -> Unit, onAdd: () -> U
         LazyColumn(Modifier.fillMaxSize()) {
             items(chats, key = { it.chat }) { c ->
                 val online = if (c.isGroup) null else peers.any { it.id == c.chat }
-                ChatRow(c, online, peers, onClick = { onOpen(c.chat) })
+                ChatRow(c, online, peers, onClick = { onOpen(c.chat) }, onLongClick = { target = c })
             }
             if (chats.size <= 1) item {
                 Text("Ajoute des contacts depuis le radar (téléphones à portée), avec un QR code ou un code PRX.", color = Px.Muted, fontSize = 13.sp, modifier = Modifier.padding(20.dp, 24.dp))
             }
         }
     }
+    target?.let { c ->
+        ChatActions(c, onDismiss = { target = null },
+            onClear = { target = null; Thread { Db.get(ctx).clearChat(c.chat) }.start() },
+            onRemove = { target = null; if (c.isGroup) svc?.messenger?.leaveGroup(c.chat) else Thread { Db.get(ctx).deleteContact(c.chat) }.start() })
+    }
 }
 
 @Composable
-private fun ChatRow(c: ChatSummary, online: Boolean?, peers: List<fr.proximo.app.mesh.Peer>, onClick: () -> Unit) {
+private fun ChatActions(c: ChatSummary, onDismiss: () -> Unit, onClear: () -> Unit, onRemove: () -> Unit) {
+    val isAll = c.chat == Db.ALL
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss, containerColor = Px.Card,
+        title = { Text(c.name, color = Color.White) },
+        text = { Text(if (isAll) "Vider ton historique de « Tout le monde » sur ce téléphone ? Le canal reste." else "Que veux-tu faire ? Les messages ne sont effacés que sur ce téléphone.", color = Px.Muted) },
+        confirmButton = {
+            androidx.compose.material3.TextButton(onClick = onClear) { Text("Effacer les messages", color = Px.Danger) }
+            if (!isAll) androidx.compose.material3.TextButton(onClick = onRemove) { Text(if (c.isGroup) "Quitter le groupe" else "Supprimer le contact", color = Px.Danger) }
+        },
+        dismissButton = { androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Annuler", color = Px.Muted) } },
+    )
+}
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun ChatRow(c: ChatSummary, online: Boolean?, peers: List<fr.proximo.app.mesh.Peer>, onClick: () -> Unit, onLongClick: () -> Unit) {
     val isAll = c.chat == Db.ALL
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).background(if (isAll) Px.AccentDark else Color.Transparent, RoundedCornerShape(16.dp)).clickable(onClick = onClick).padding(10.dp, 10.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).background(if (isAll) Px.AccentDark else Color.Transparent, RoundedCornerShape(16.dp)).combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(10.dp, 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (isAll) Box(Modifier.size(50.dp).background(Color.White.copy(alpha = 0.15f), CircleShape), contentAlignment = Alignment.Center) { Text("👥", fontSize = 22.sp) }

@@ -5,8 +5,8 @@ plugins {
 }
 
 // Version de l'appli : à augmenter à chaque nouvelle APK (versionCode +1).
-val appVersionCode = 7
-val appVersionName = "1.2.1"
+val appVersionCode = 8
+val appVersionName = "1.3.0"
 
 android {
     namespace = "fr.proximo.app"

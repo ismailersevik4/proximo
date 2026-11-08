@@ -121,10 +121,18 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         else writableDatabase.execSQL("UPDATE messages SET status=MAX(status,?) WHERE mid=?", arrayOf(status, mid))
         bump()
     }
+    /** Un message jamais parti (personne à portée) : « Échec », sans toucher à ceux déjà relayés ou reçus. */
+    fun failIfPending(mid: String) { writableDatabase.execSQL("UPDATE messages SET status=? WHERE mid=? AND status=?", arrayOf(Message.FAILED, mid, Message.PENDING)); bump() }
     fun markRead(chat: String) { writableDatabase.execSQL("UPDATE messages SET read=1 WHERE chat=? AND read=0", arrayOf(chat)); bump() }
     fun unreadTotal(): Int = q("SELECT COUNT(*) FROM messages WHERE read=0 AND mine=0") { it.getInt(0) }.firstOrNull() ?: 0
-    fun deleteMessage(mid: String) { writableDatabase.delete("messages", "mid=?", arrayOf(mid)); bump() }
-    fun clearChat(chat: String) { writableDatabase.delete("messages", "chat=?", arrayOf(chat)); bump() }
+    fun deleteMessage(mid: String) {
+        message(mid)?.file?.let { java.io.File(it).delete() }
+        writableDatabase.delete("messages", "mid=?", arrayOf(mid)); bump()
+    }
+    fun clearChat(chat: String) {
+        for (f in q("SELECT file FROM messages WHERE chat=? AND file IS NOT NULL", chat) { it.getString(0) }) java.io.File(f).delete()
+        writableDatabase.delete("messages", "chat=?", arrayOf(chat)); bump()
+    }
 
     fun chatSummaries(): List<ChatSummary> {
         val out = ArrayList<ChatSummary>()
@@ -149,7 +157,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         writableDatabase.delete("seen", "t<?", arrayOf(d.toString()))
         // Mes messages jamais remis après 3 jours : marqués « Échec » (ils ne repartiront plus).
         for (fid in q("SELECT fid FROM outbox WHERE created<? AND mine=1", d.toString()) { it.getString(0) }) {
-            writableDatabase.execSQL("UPDATE messages SET status=? WHERE mid=? AND status<?", arrayOf(Message.FAILED, fid, Message.DELIVERED))
+            writableDatabase.execSQL("UPDATE messages SET status=? WHERE mid=? AND status=?", arrayOf(Message.FAILED, fid, Message.PENDING))
         }
         for (fid in q("SELECT fid FROM outbox WHERE created<?", d.toString()) { it.getString(0) }) removeOutbox(fid)
         val h = System.currentTimeMillis() - 24L * 3600 * 1000
