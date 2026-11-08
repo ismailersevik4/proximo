@@ -61,6 +61,9 @@ fun AppRoot(activity: MainActivity) {
 
     if (!ready) { Onboarding(onDone = { name -> identity.name = name; ready = true; activity.requestPermissions() }); return }
     if (!activity.permissionsOk) { PermissionsScreen(onAsk = { activity.requestPermissions() }, deniedOnce = activity.permissionsDeniedOnce, onSettings = { activity.openAppSettings() }); return }
+    val settings = remember { fr.proximo.app.core.Settings.get(ctx) }
+    var batteryStep by remember { mutableStateOf(!activity.batteryOk && !settings.batteryAsked) }
+    if (batteryStep) { BatteryScreen(onAllow = { activity.requestBatteryExemption(); settings.batteryAsked = true; batteryStep = false }, onLater = { settings.batteryAsked = true; batteryStep = false }); return }
 
     LaunchedEffect(Unit) { MeshService.start(ctx) }
     val svc by serviceState()
@@ -162,6 +165,24 @@ fun PermissionsScreen(onAsk: () -> Unit, deniedOnce: Boolean, onSettings: () -> 
             Spacer(Modifier.height(8.dp))
             androidx.compose.material3.TextButton(onClick = onSettings) { Text("Ouvrir les réglages de l'appli") }
         }
+    }
+}
+
+@Composable
+fun BatteryScreen(onAllow: () -> Unit, onLater: () -> Unit) {
+    Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Logo(90.dp)
+        Spacer(Modifier.height(24.dp))
+        Text("Laisser Proximo tourner en arrière-plan", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Pour recevoir les messages écran éteint, Android ne doit pas mettre Proximo en veille. À l'écran suivant, choisis « Autoriser ».\n\nSur Samsung, Xiaomi, Huawei, Oppo : vérifie aussi dans Paramètres → Batterie que Proximo est « Non restreinte » et dans « Applications jamais mises en veille ».",
+            color = Px.Muted, textAlign = TextAlign.Center, fontSize = 14.sp,
+        )
+        Spacer(Modifier.height(24.dp))
+        Button(onClick = onAllow, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Autoriser", fontWeight = FontWeight.Bold) }
+        Spacer(Modifier.height(8.dp))
+        androidx.compose.material3.TextButton(onClick = onLater) { Text("Plus tard", color = Px.Muted) }
     }
 }
 

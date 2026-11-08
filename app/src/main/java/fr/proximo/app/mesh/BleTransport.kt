@@ -65,6 +65,8 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         @Volatile var writing = false
         var retries = 0
         var lastSeen = System.currentTimeMillis()
+        var lastRx = System.currentTimeMillis()   // dernière trame reçue (battement de cœur)
+        var lastPing = 0L
         var rssi = 0
         val chunk get() = (mtu - 3).coerceIn(Fragmenter.HDR + 1, 509)
     }
@@ -80,6 +82,12 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         running = true
         val a = adapter
         if (a == null || !a.isEnabled) { listener.onStatus(name, false, "Bluetooth éteint"); return }
+        if (Build.VERSION.SDK_INT < 31) {
+            // Avant Android 12, le scan Bluetooth exige que la localisation du téléphone soit activée.
+            val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+            val on = try { lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) || lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER) } catch (e: Exception) { true }
+            if (!on) listener.onStatus(name, false, "Active la localisation du téléphone : Android l'exige pour que le Bluetooth trouve les voisins")
+        }
         try {
             startServer()
             startAdvertising()
@@ -190,6 +198,7 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val link = links[gatt.device.address] ?: return
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                try { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) } catch (_: Exception) {}
                 if (!gatt.requestMtu(517)) gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) dropLink(link)
         }
@@ -229,6 +238,12 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         sendHello(link)
         link.peerId?.let { listener.onPeerSeen(it, null, name, link.rssi) }
         link.peerId?.let { MeshService.instance?.core?.onLinkReady(it) }
+    }
+
+    /** Battement de cœur : permet de voir en 30 s qu'un voisin s'est endormi (Samsung…) au lieu d'attendre 90 s. */
+    private fun sendPing(link: Link, pong: Boolean) {
+        val f = Frame(Frame.PING, 0, 0, 0, Frame.newId(), Hex.dec(myId), Frame.BROADCAST, byteArrayOf(if (pong) 1 else 0))
+        link.queue.add(f.encode()); pump(link)
     }
 
     private fun sendHello(link: Link) {
@@ -324,9 +339,15 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
 
     private fun incoming(address: String, chunk: ByteArray) {
         val link = links[address] ?: return
-        link.lastSeen = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        link.lastSeen = now; link.lastRx = now
         val full = link.assembler.feed(chunk) ?: return
         val f = Frame.decode(full) ?: return
+        if (f.type == Frame.PING) {
+            // 0 = ping -> on répond ; 1 = pong -> rien à faire (lastRx suffit)
+            if (f.payload.isNotEmpty() && f.payload[0] == 0.toByte()) sendPing(link, pong = true)
+            return
+        }
         if (f.type == Frame.HELLO) {
             val wasIdentified = link.peerId != null && link.ready
             link.peerId = f.fromHex
@@ -340,20 +361,23 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         listener.onFrame(full, pid, name)
     }
 
+    private var ticks = 0
     private val housekeeping = object : Runnable {
         override fun run() {
             if (!running) return
             val now = System.currentTimeMillis()
-            // Voisins plus annoncés depuis 90 s : on coupe la liaison.
             for (l in links.values.toList()) {
+                // Liaison ouverte mais muette depuis 45 s malgré les pings : le voisin dort ou est parti.
+                if (l.ready && now - l.lastRx > 45_000) { Log.i(tag, "liaison muette avec ${l.peerId} : coupée"); dropLink(l); continue }
+                if (l.ready && now - l.lastPing > 15_000) { l.lastPing = now; sendPing(l, pong = false) }
+                // Voisins plus annoncés depuis 90 s : on coupe la liaison.
                 val adv = seenAdv[l.address] ?: l.lastSeen
                 if (now - maxOf(adv, l.lastSeen) > 90_000) dropLink(l)
             }
             for ((addr, t) in seenAdv.entries.toList()) if (now - t > 90_000) { seenAdv.remove(addr); idByAddress[addr]?.let { id -> if (links.values.none { it.peerId == id }) listener.onPeerLost(id, name) } }
-            // Sur certains téléphones le scan s'arrête tout seul : on le relance de temps en temps.
-            try { scanner?.stopScan(scanCb) } catch (_: Exception) {}
-            startScan()
-            handler.postDelayed(this, 30_000)
+            // Sur certains téléphones le scan s'arrête tout seul : on le relance de temps en temps (toutes les 30 s).
+            if (++ticks % 2 == 0) { try { scanner?.stopScan(scanCb) } catch (_: Exception) {}; startScan() }
+            handler.postDelayed(this, 15_000)
         }
     }
 

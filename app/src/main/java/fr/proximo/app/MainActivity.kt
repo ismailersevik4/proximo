@@ -28,6 +28,7 @@ class MainActivity : ComponentActivity() {
         if (Identity.get(this).isReady && permissionsOk) MeshService.start(this)
     }
     var permissionsDeniedOnce by mutableStateOf(false)
+    var batteryOk by mutableStateOf(true)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,12 +45,26 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         isForeground = true
+        batteryOk = batteryExempt()
         permissionsOk = requiredPermissions().all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
         if (Identity.get(this).isReady && permissionsOk) MeshService.start(this)
         MeshService.instance?.updater?.retryPendingInstall()
     }
 
     override fun onPause() { isForeground = false; super.onPause() }
+
+    /** Vrai si Android laisse Proximo tourner en arrière-plan sans le mettre en veille. */
+    fun batteryExempt(): Boolean = try { (getSystemService(POWER_SERVICE) as android.os.PowerManager).isIgnoringBatteryOptimizations(packageName) } catch (e: Exception) { true }
+
+    /** Fenêtre Android « Autoriser Proximo à tourner en arrière-plan ? » ; à défaut, la liste des applis optimisées. */
+    @android.annotation.SuppressLint("BatteryLife")
+    fun requestBatteryExemption() {
+        try {
+            startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:$packageName")))
+        } catch (e: Exception) {
+            try { startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (_: Exception) {}
+        }
+    }
 
     /** Ouvre la fiche de l'appli dans les réglages Android (quand une autorisation a été refusée définitivement). */
     fun openAppSettings() {

@@ -40,6 +40,11 @@ class Settings private constructor(ctx: Context) {
         get() = p.getBoolean("shareUpdates", true)
         set(v) { p.edit().putBoolean("shareUpdates", v).apply(); bump() }
 
+    /** L'écran « économie d'énergie » a déjà été proposé. */
+    var batteryAsked: Boolean
+        get() = p.getBoolean("batteryAsked", false)
+        set(v) { p.edit().putBoolean("batteryAsked", v).apply(); bump() }
+
     /** Réseau arrêté à la main depuis les réglages (ne pas relancer tout seul). */
     var stoppedManually: Boolean
         get() = p.getBoolean("stopped", false)

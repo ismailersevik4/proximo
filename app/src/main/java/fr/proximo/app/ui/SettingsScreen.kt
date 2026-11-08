@@ -67,6 +67,15 @@ fun SettingsScreen(onBack: () -> Unit) {
             }
             Spacer(Modifier.height(14.dp))
             Section("Réseau") {
+                val act = ctx as? fr.proximo.app.MainActivity
+                val exempt = act?.batteryExempt() ?: true
+                Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(if (exempt) "Arrière-plan autorisé ✓" else "Arrière-plan : à autoriser", color = if (exempt) Color.White else Px.Warn)
+                        Text(if (exempt) "Android ne met pas Proximo en veille. Sur Samsung, vérifie aussi « Applications jamais mises en veille »." else "Sans ça, les messages n'arrivent plus quand l'écran est éteint.", color = Px.Muted, fontSize = 12.sp)
+                    }
+                    TextButton(onClick = { act?.requestBatteryExemption() }) { Text(if (exempt) "Réglages" else "Autoriser") }
+                }
                 val stopped = settings.stoppedManually
                 Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

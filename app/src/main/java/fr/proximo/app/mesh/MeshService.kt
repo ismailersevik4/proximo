@@ -30,6 +30,7 @@ class MeshService : Service() {
     lateinit var messenger: Messenger
     lateinit var updater: Updater
     lateinit var calls: CallManager
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -54,6 +55,11 @@ class MeshService : Service() {
         core.onLinkUp = { p -> messenger.onPeerAppeared(p); updater.onPeerAppeared(p) }
         core.setMode(Settings.get(this).mode)
         core.start()
+        // Garde le processeur éveillé pour le Bluetooth quand l'écran est éteint (les vieux téléphones coupent sinon).
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "Proximo:reseau").also { it.setReferenceCounted(false); it.acquire() }
+        } catch (_: Exception) {}
         ContextCompat.registerReceiver(this, radioReceiver, IntentFilter().apply {
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             addAction(WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED)
@@ -76,7 +82,20 @@ class MeshService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
+    /** L'utilisateur a balayé l'appli des récents : certains téléphones tuent le service, on le relance 3 s plus tard. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (Settings.get(this).stoppedManually) return
+        try {
+            val pi = PendingIntent.getForegroundService(this, 1, Intent(this, MeshService::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()) am.setExactAndAllowWhileIdle(android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP, android.os.SystemClock.elapsedRealtime() + 3000, pi)
+            else am.set(android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP, android.os.SystemClock.elapsedRealtime() + 3000, pi)
+        } catch (_: Exception) {}
+    }
+
     override fun onDestroy() {
+        try { wakeLock?.release() } catch (_: Exception) {}
         try { unregisterReceiver(radioReceiver) } catch (_: Exception) {}
         try { core.stop() } catch (_: Exception) {}
         calls.hangup()
