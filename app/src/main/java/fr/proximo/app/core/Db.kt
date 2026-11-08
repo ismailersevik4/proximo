@@ -153,9 +153,9 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         writableDatabase.execSQL("INSERT OR IGNORE INTO seen VALUES(?,?)", arrayOf(fid, System.currentTimeMillis()))
     }
     fun purgeOld() {
-        val d = System.currentTimeMillis() - 3L * 24 * 3600 * 1000
-        writableDatabase.delete("seen", "t<?", arrayOf(d.toString()))
-        // Mes messages jamais remis après 3 jours : marqués « Échec » (ils ne repartiront plus).
+        val d = System.currentTimeMillis() - 7L * 24 * 3600 * 1000
+        writableDatabase.delete("seen", "t<?", arrayOf((System.currentTimeMillis() - 10L * 24 * 3600 * 1000).toString()))
+        // Mes messages jamais remis après 7 jours : marqués « Échec » (ils ne repartiront plus).
         for (fid in q("SELECT fid FROM outbox WHERE created<? AND mine=1", d.toString()) { it.getString(0) }) {
             writableDatabase.execSQL("UPDATE messages SET status=? WHERE mid=? AND status=?", arrayOf(Message.FAILED, fid, Message.PENDING))
         }

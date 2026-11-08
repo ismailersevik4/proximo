@@ -237,9 +237,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val now = System.currentTimeMillis()
         val entries = try { db.outbox() } catch (e: Exception) { Log.e(tag, "file d'attente", e); emptyList() }
         for (o in entries) try {
-            // Ce que je relaie pour d'autres : gardé 1 h (privé) ou 24 h (« Tout le monde » et SOS, pour les retardataires) ; le mien 3 jours.
-            val otype = if (o.data.size > 3) o.data[3].toInt() and 0xff else 0
-            val keep = if (otype == Frame.PUBLIC || otype == Frame.SOS) 24 * 3600_000L else 3600_000L
+            // Ce que je relaie pour d'autres : gardé 48 h (24 h pour les gros contenus comme les vidéos) ; le mien 7 jours (purge).
+            val keep = if (o.data.size > 1_000_000) 24 * 3600_000L else 48 * 3600_000L
             if (!o.mine && now - o.created > keep) { db.removeOutbox(o.fid); continue }
             val isDirect = o.dest != Hex.enc(Frame.BROADCAST)
             var changed = false

@@ -191,15 +191,20 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     /** Quand une liaison s'ouvre : on demande sa carte (clés publiques) si besoin, et on lui envoie ma photo de profil. */
     fun onPeerAppeared(p: Peer) {
         if (!cards.containsKey(p.id)) askCard(p.id)
-        sendAvatar(p.id)
+        sendAvatar(p.id, force = true)
     }
 
     /** Ma photo de profil vers un voisin (petit JPEG), ou vers tous les voisins connectés quand je la change. */
-    fun sendAvatar(peerId: String?) {
+    private val avatarSentAt = ConcurrentHashMap<String, Long>()
+    fun sendAvatar(peerId: String?, force: Boolean = true) {
         val mine = fr.proximo.app.core.Avatars.mine(ctx)
         val payload = mine ?: ByteArray(0) // vide = « plus de photo »
         val targets = if (peerId != null) listOf(peerId) else core.connectedPeerIds().toList()
-        for (t in targets) core.send(Frame(Frame.AVATAR, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(t), payload))
+        val now = System.currentTimeMillis()
+        for (t in targets) {
+            if (!force && now - (avatarSentAt[t] ?: 0L) < 10 * 60_000) continue
+            if (core.sendTo(t, Frame(Frame.AVATAR, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(t), payload).encode())) avatarSentAt[t] = now
+        }
     }
     /** La photo a changé : prévenir l'interface et les voisins. */
     val avatarsChanged = MutableStateFlow(0L)
@@ -234,7 +239,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     /** Rend false si la trame n'a pas pu être traitée faute de clé (elle pourra être rejouée). */
     fun handle(f: Frame, fromPeer: String): Boolean {
         when (f.type) {
-            Frame.CARD_REQ -> core.send(Frame(Frame.CARD, 0, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray()))
+            Frame.CARD_REQ -> { core.send(Frame(Frame.CARD, 0, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray())); sendAvatar(f.fromHex, force = false) }
             Frame.CARD -> onCard(f)
             Frame.CONTACT_REQ -> onContactReq(f)
             Frame.CONTACT_ACCEPT -> onContactAccept(f)
@@ -246,6 +251,8 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
                 if (f.payload.isEmpty()) fr.proximo.app.core.Avatars.remove(ctx, f.fromHex)
                 else if (f.payload.size <= fr.proximo.app.core.Avatars.MAX_BYTES + 2000) fr.proximo.app.core.Avatars.save(ctx, f.fromHex, f.payload)
                 avatarsChanged.value = avatarsChanged.value + 1
+                // Échange : je lui renvoie la mienne s'il ne l'a pas eue récemment (chacun voit la photo de l'autre).
+                sendAvatar(f.fromHex, force = false)
             }
         }
         return true
