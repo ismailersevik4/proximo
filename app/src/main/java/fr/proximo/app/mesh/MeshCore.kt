@@ -75,6 +75,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     fun connectedPeerIds(): Set<String> = transports.flatMap { it.connectedPeers() }.toSet()
     /** Vrai si une prise Wi-Fi direct (gros débit) est ouverte avec ce voisin. */
     fun hasWifiLink(peerId: String): Boolean = transports.any { it.name == Modes.WIFI && it.hasFastLink(peerId) }
+    /** Voisins avec une prise Wi-Fi direct ouverte. */
+    fun wifiLinkedPeers(): List<String> = peerMap.keys.filter { hasWifiLink(it) }
 
     // ---------------- transports -> cœur ----------------
     override fun onPeerSeen(peerId: String, name: String?, transport: String, rssi: Int) {
@@ -149,6 +151,11 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             if (recentSeen.size > 5000) recentSeen.entries.removeAll { now - it.value > 600_000 }
         }
         val forMe = f.isBroadcast || f.toHex == me.id
+        // Appel via moi : je passe la trame au destinataire si j'ai une prise Wi-Fi avec lui (un seul relais).
+        if (f.type == Frame.CALL && !forMe) {
+            if (f.hops == 0 && hasWifiLink(f.toHex)) { val fwd = f.forwarded(); sendTo(f.toHex, fwd.encode()) }
+            return
+        }
         var handled = true
         if (forMe) {
             handled = try { handler?.invoke(f, fromPeer) ?: true } catch (e: Exception) { Log.e(tag, "traitement", e); true }
@@ -192,8 +199,9 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     /** Envoi direct (sans relais ni attente) : vrai si un transport a pris la trame. */
     fun sendTo(peerId: String, data: ByteArray): Boolean {
         val type = if (data.size > 3) data[3].toInt() and 0xff else 0
-        // Appels et morceaux d'APK : uniquement par la prise Wi-Fi (le Bluetooth est bien trop lent).
-        if (type == Frame.CALL || type == Frame.APK) {
+        val flags = if (data.size > 6) data[6].toInt() and 0xff else 0
+        // Appels, morceaux d'APK et trames marquées « Wi-Fi seulement » (vidéos) : uniquement par la prise Wi-Fi.
+        if (type == Frame.CALL || type == Frame.APK || (flags and Frame.FLAG_WIFI_ONLY) != 0) {
             val t = transports.firstOrNull { it.name == Modes.WIFI } ?: return false
             return t.hasFastLink(peerId) && t.send(peerId, data)
         }

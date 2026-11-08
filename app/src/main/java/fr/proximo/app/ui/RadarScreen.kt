@@ -121,7 +121,7 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
                         when { c?.accepted == true -> "Dans tes contacts"; c?.status == 0 -> "Demande envoyée, en attente"; c?.status == 2 -> "Il veut t'ajouter en contact"; else -> "Pas encore dans tes contacts" },
                         color = Px.AccentSoft,
                     )
-                    if (!canCall) { Spacer(Modifier.height(6.dp)); Text("Pas d'appel en direct possible : il faut une liaison Wi-Fi direct ouverte entre vous deux. Le talkie-walkie marche.", color = Px.Muted, fontSize = 12.sp) }
+                    if (!canCall) { Spacer(Modifier.height(6.dp)); Text("Pas d'appel possible : il faut une liaison Wi-Fi direct (avec lui, ou avec un voisin qui l'a). Le talkie-walkie marche.", color = Px.Muted, fontSize = 12.sp) }
                 }
             },
             confirmButton = {

@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -58,6 +59,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -117,6 +119,24 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         if (ok) scope.launch { val b = withContext(Dispatchers.IO) { Photos.compress(ctx, photoUri) }; if (b != null) svc?.messenger?.sendPhoto(chat, b) }
     }
     val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) takePhoto.launch(photoUri) }
+    // Vidéos : filmées directement en basse qualité (15 s), ou choisies dans la galerie si elles sont légères.
+    val videoFile = remember { File(ctx.cacheDir, "video.mp4") }
+    val videoUri = remember { FileProvider.getUriForFile(ctx, ctx.packageName + ".files", videoFile) }
+    fun sendVideoFrom(uri: Uri) = scope.launch {
+        val (res, err) = withContext(Dispatchers.IO) { Videos.load(ctx, uri) }
+        if (res != null) svc?.messenger?.sendVideo(chat, res.first, res.second) else svc?.messenger?.event(err ?: "Vidéo illisible")
+    }
+    val captureVideo = rememberLauncherForActivityResult(object : ActivityResultContracts.CaptureVideo() {
+        override fun createIntent(context: android.content.Context, input: Uri): Intent = super.createIntent(context, input)
+            .putExtra(android.provider.MediaStore.EXTRA_DURATION_LIMIT, Videos.MAX_SECONDS)
+            .putExtra(android.provider.MediaStore.EXTRA_VIDEO_QUALITY, 0)
+            .putExtra(android.provider.MediaStore.EXTRA_SIZE_LIMIT, Videos.MAX_BYTES)
+    }) { ok -> if (ok) sendVideoFrom(videoUri) }
+    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) sendVideoFrom(uri) }
+    val askCameraVideo = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) captureVideo.launch(videoUri) }
+    fun videoGuard(action: () -> Unit) {
+        if (svc?.messenger?.canSendVideo(chat) == true) action() else svc?.messenger?.event("Vidéo impossible pour l'instant : il faut une liaison Wi-Fi direct (le Bluetooth est trop lent). Envoie une photo ou un vocal.")
+    }
 
     Column(Modifier.fillMaxSize().background(Px.Bg).imePadding()) {
         // ---- en-tête ----
@@ -132,7 +152,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             if (!isAll) Icon(Icons.Filled.Lock, "Chiffré", tint = Px.Accent, modifier = Modifier.size(18.dp))
             if (!isAll && group == null) {
                 val can = svc?.calls?.canCall(chat) == true
-                IconButton(onClick = { if (can) svc?.calls?.call(chat) else svc?.messenger?.event("Trop loin pour un appel en direct : utilise le talkie-walkie") }) {
+                IconButton(onClick = { if (can) svc?.calls?.call(chat) else svc?.messenger?.event("Trop loin pour un appel (pas de Wi-Fi direct, même via un voisin) : utilise le talkie-walkie") }) {
                     Icon(Icons.Filled.Call, "Appeler", tint = if (can) Px.Accent else Px.Muted)
                 }
             }
@@ -179,6 +199,8 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                 DropdownMenu(attach, { attach = false }) {
                     DropdownMenuItem(text = { Text("Prendre une photo") }, leadingIcon = { Icon(Icons.Filled.PhotoCamera, null) }, onClick = { attach = false; askCamera.launch(android.Manifest.permission.CAMERA) })
                     DropdownMenuItem(text = { Text("Photo de la galerie") }, leadingIcon = { Icon(Icons.Filled.Image, null) }, onClick = { attach = false; pickImage.launch("image/*") })
+                    DropdownMenuItem(text = { Text("Filmer une vidéo (15 s)") }, leadingIcon = { Icon(Icons.Filled.Videocam, null) }, onClick = { attach = false; videoGuard { askCameraVideo.launch(android.Manifest.permission.CAMERA) } })
+                    DropdownMenuItem(text = { Text("Vidéo de la galerie (4 Mo max)") }, leadingIcon = { Icon(Icons.Filled.Videocam, null) }, onClick = { attach = false; videoGuard { pickVideo.launch("video/*") } })
                     DropdownMenuItem(text = { Text("Ma position") }, leadingIcon = { Icon(Icons.Filled.Place, null) }, onClick = {
                         attach = false
                         scope.launch { val l = Locations.current(ctx); if (l != null) svc?.messenger?.sendLocation(chat, l.latitude, l.longitude) else svc?.messenger?.event("Position introuvable (GPS éteint ?)") }
@@ -257,6 +279,17 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                     openSafely(ctx, Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                 }) }
                 Message.VOICE -> VoiceRow(m)
+                Message.VIDEO -> m.file?.let { path ->
+                    val thumb by androidx.compose.runtime.produceState<android.graphics.Bitmap?>(null, path) { value = withContext(Dispatchers.IO) { Videos.thumbnail(path) } }
+                    Box(Modifier.fillMaxWidth().height(200.dp).background(Px.Card, RoundedCornerShape(12.dp)).clickable {
+                        val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", File(path))
+                        openSafely(ctx, Intent(Intent.ACTION_VIEW).setDataAndType(uri, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                    }, contentAlignment = Alignment.Center) {
+                        thumb?.let { androidx.compose.foundation.Image(it.asImageBitmap(), "Vidéo", Modifier.fillMaxWidth().height(200.dp), contentScale = androidx.compose.ui.layout.ContentScale.Crop) }
+                        Box(Modifier.size(54.dp).background(Color.Black.copy(alpha = 0.55f), CircleShape), contentAlignment = Alignment.Center) { Icon(Icons.Filled.PlayArrow, "Lire", tint = Color.White, modifier = Modifier.size(32.dp)) }
+                        Text("🎬 ${m.body} s", color = Color.White, fontSize = 12.sp, modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp).background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(6.dp)).padding(6.dp, 2.dp))
+                    }
+                }
                 Message.LOC -> {
                     val parts = m.body.split(",")
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable {

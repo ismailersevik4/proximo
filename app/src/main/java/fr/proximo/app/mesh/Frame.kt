@@ -65,6 +65,8 @@ class Frame(
         const val PING = 13          // mesure de présence (direct uniquement)
 
         val DIRECT_ONLY = setOf(HELLO, CARD_REQ, CARD, CALL, APK, PING)
+        /** Drapeau : ne passer que par une prise Wi-Fi direct (vidéos, gros fichiers). */
+        const val FLAG_WIFI_ONLY = 1
         val BROADCAST = ByteArray(8)
 
         fun newId(): ByteArray = Crypto.random(16)

@@ -98,13 +98,16 @@ fun CallScreen(s: CallState) {
             Spacer(Modifier.height(6.dp))
             Text(
                 when (s.phase) {
-                    CallState.RINGING_IN -> "Appel entrant · Wi-Fi direct"
+                    CallState.SEARCHING -> "Recherche d'un chemin via un voisin…"
+                    CallState.RINGING_IN -> "Appel entrant"
                     CallState.RINGING_OUT -> "Appel en cours…"
                     else -> { val sec = (now - s.since) / 1000; String.format("%02d:%02d", sec / 60, sec % 60) }
                 }, color = Px.AccentSoft, fontSize = 16.sp,
             )
+            Spacer(Modifier.height(6.dp))
+            if (s.phase != CallState.SEARCHING) Text(if (s.via != null) "🔒 Chiffré · via ${s.viaName ?: "un voisin"} (2 sauts)" else "🔒 Chiffré · Wi-Fi direct", color = Px.Accent, fontSize = 13.sp)
             Spacer(Modifier.height(10.dp))
-            Text("Appel en direct entre les deux téléphones par Wi-Fi direct (bêta, pas encore chiffré). Si la liaison se dégrade, utilise le talkie-walkie.", color = Px.Muted, fontSize = 12.sp, textAlign = TextAlign.Center)
+            Text("Appel chiffré de bout en bout (bêta). Le relais éventuel ne peut pas écouter. Si la liaison se dégrade, utilise le talkie-walkie.", color = Px.Muted, fontSize = 12.sp, textAlign = TextAlign.Center)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(28.dp), verticalAlignment = Alignment.CenterVertically) {
             if (s.phase == CallState.ACTIVE) {

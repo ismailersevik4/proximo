@@ -12,64 +12,106 @@ import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.Ringtone
 import android.media.RingtoneManager
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import fr.proximo.app.MainActivity
 import fr.proximo.app.R
+import fr.proximo.app.core.B64
+import fr.proximo.app.core.Crypto
 import fr.proximo.app.core.Db
 import fr.proximo.app.core.Hex
+import fr.proximo.app.core.Identity
 import fr.proximo.app.mesh.Frame
 import fr.proximo.app.mesh.MeshCore
 import fr.proximo.app.mesh.MeshService
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.json.JSONObject
+import java.nio.ByteBuffer
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
-data class CallState(val phase: Int, val peerId: String, val peerName: String, val since: Long, val speaker: Boolean = true, val muted: Boolean = false) {
-    companion object { const val IDLE = 0; const val RINGING_IN = 1; const val RINGING_OUT = 2; const val ACTIVE = 3 }
+data class CallState(
+    val phase: Int, val peerId: String, val peerName: String, val since: Long,
+    val speaker: Boolean = true, val muted: Boolean = false,
+    /** Voisin qui relaie l'appel (null = direct). */
+    val via: String? = null, val viaName: String? = null,
+) {
+    companion object { const val IDLE = 0; const val RINGING_IN = 1; const val RINGING_OUT = 2; const val ACTIVE = 3; const val SEARCHING = 4 }
 }
 
 /**
- * Appels vocaux en direct (bêta) : son PCM 8 kHz envoyé par petits paquets au voisin, par Wi-Fi direct.
- * Pas de relais : il faut que l'autre téléphone soit à portée Wi-Fi.
+ * Appels vocaux (bêta) : son PCM 8 kHz, chiffré paquet par paquet (AES-GCM, clé de session X25519),
+ * envoyé par Wi-Fi direct, en direct ou via UN voisin relais (2 sauts).
  */
 @SuppressLint("MissingPermission")
 class CallManager(private val ctx: Context, private val core: MeshCore) {
     private val tag = "ProximoAppel"
     private val db = Db.get(ctx)
+    private val me = Identity.get(ctx)
     val state = MutableStateFlow(CallState(CallState.IDLE, "", "", 0))
     private val running = AtomicBoolean(false)
     private var record: AudioRecord? = null
     private var track: AudioTrack? = null
     private var ringtone: Ringtone? = null
     private val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val handler = Handler(Looper.getMainLooper())
+    private val playQueue = LinkedBlockingQueue<ByteArray>()
 
-    /** Un appel exige une prise Wi-Fi direct ouverte avec le voisin (le Bluetooth est trop lent pour la voix). */
-    fun canCall(peerId: String): Boolean = core.hasWifiLink(peerId)
-    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
-    private val playQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+    // Chiffrement de la session
+    private var key: ByteArray? = null
+    private var salt = ByteArray(7)
+    private var sendDir: Byte = 1
+    private var seq = 0
+    private var lastRecvSeq = -1
+
+    /** Un appel est possible en direct (prise Wi-Fi) ou peut-être via un voisin (il faut au moins une prise Wi-Fi). */
+    fun canCall(peerId: String): Boolean = contactKey(peerId) != null && (core.hasWifiLink(peerId) || core.wifiLinkedPeers().isNotEmpty())
+
+    private fun contactKey(peerId: String): ByteArray? = db.contact(peerId)?.dhPub ?: MeshService.instance?.messenger?.cards?.get(peerId)?.dhPub
 
     fun call(peerId: String) {
         if (state.value.phase != CallState.IDLE) return
-        if (!canCall(peerId)) return
         val name = db.contact(peerId)?.name ?: core.peer(peerId)?.name ?: "Contact"
-        state.value = CallState(CallState.RINGING_OUT, peerId, name, System.currentTimeMillis())
-        signal(peerId, "invite")
-        // Pas de réponse en 45 s : on raccroche.
+        if (contactKey(peerId) == null) { MeshService.instance?.messenger?.event("Ajoute d'abord $name en contact pour l'appeler"); return }
+        if (core.hasWifiLink(peerId)) { startOutgoing(peerId, name, null); return }
+        // Pas de prise directe : on demande aux voisins Wi-Fi s'ils ont une prise avec lui.
+        val candidates = core.wifiLinkedPeers().filter { it != peerId }
+        if (candidates.isEmpty()) { MeshService.instance?.messenger?.event("Trop loin pour un appel : utilise le talkie-walkie"); return }
+        state.value = CallState(CallState.SEARCHING, peerId, name, System.currentTimeMillis())
+        for (r in candidates) sendJson(r, JSONObject().put("c", "probe").put("to", peerId), null)
+        handler.postDelayed({
+            val s = state.value
+            if (s.phase == CallState.SEARCHING && s.peerId == peerId) { state.value = CallState(CallState.IDLE, "", "", 0); MeshService.instance?.messenger?.event("Trop loin pour un appel, même via un voisin : utilise le talkie-walkie") }
+        }, 4000)
+    }
+
+    private fun startOutgoing(peerId: String, name: String, via: String?) {
+        salt = Crypto.random(7); sendDir = 1; seq = 0; lastRecvSeq = -1
+        key = deriveKey(peerId)
+        val viaName = via?.let { db.contact(it)?.name ?: core.peer(it)?.name }
+        state.value = CallState(CallState.RINGING_OUT, peerId, name, System.currentTimeMillis(), via = via, viaName = viaName)
+        val j = JSONObject().put("c", "invite").put("salt", B64.enc(salt)).apply { if (via != null) put("via", via) }
+        sendJson(peerId, j, via)
         handler.postDelayed({ val st = state.value; if (st.phase == CallState.RINGING_OUT && st.peerId == peerId) { hangup(); MeshService.instance?.messenger?.event("Pas de réponse") } }, 45_000)
     }
 
     fun accept() {
         val s = state.value; if (s.phase != CallState.RINGING_IN) return
         stopRing()
-        signal(s.peerId, "accept")
+        sendJson(s.peerId, JSONObject().put("c", "accept"), s.via)
         startAudio(s)
     }
 
     fun reject() {
         val s = state.value; if (s.phase != CallState.RINGING_IN) return
-        stopRing(); signal(s.peerId, "reject")
+        stopRing(); sendJson(s.peerId, JSONObject().put("c", "reject"), s.via)
         state.value = CallState(CallState.IDLE, "", "", 0)
         NotificationManagerCompat.from(ctx).cancel(NOTIF)
     }
@@ -77,34 +119,91 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     fun hangup() {
         val s = state.value
         if (s.phase == CallState.IDLE) return
-        signal(s.peerId, "hangup")
+        if (s.phase != CallState.SEARCHING) sendJson(s.peerId, JSONObject().put("c", "hangup"), s.via)
         endCall()
     }
 
     fun toggleSpeaker() { val s = state.value; state.value = s.copy(speaker = !s.speaker); audio.isSpeakerphoneOn = !s.speaker }
     fun toggleMute() { val s = state.value; state.value = s.copy(muted = !s.muted) }
 
-    private fun signal(peerId: String, c: String) {
-        core.send(Frame(Frame.CALL, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), JSONObject().put("c", c).toString().toByteArray()))
+    /** Envoie une trame d'appel au destinataire, directement ou en la confiant au relais. */
+    private fun sendFrame(peerId: String, payload: ByteArray, via: String?) {
+        val f = Frame(Frame.CALL, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), payload)
+        core.sendTo(via ?: peerId, f.encode())
+    }
+    private fun sendJson(peerId: String, j: JSONObject, via: String?) = sendFrame(peerId, j.toString().toByteArray(), via)
+
+    /** Clé de session : X25519(ma clé, sa clé) -> HKDF avec les deux identifiants triés. */
+    private fun deriveKey(peerId: String): ByteArray? {
+        val pub = contactKey(peerId) ?: return null
+        val ids = listOf(me.id, peerId).sorted().joinToString("|")
+        return Crypto.hkdf(Crypto.agree(me.dhPriv, pub), ids.toByteArray(), "proximo-call".toByteArray())
+    }
+
+    /** Paquet son : [1][dir][seq(4)][AES-GCM(iv = dir + salt(7) + seq(4), aad = seq)]. */
+    private fun sealAudio(pcm: ByteArray, n: Int): ByteArray? {
+        val k = key ?: return null
+        val s = seq++
+        val iv = ByteBuffer.allocate(12).put(sendDir).put(salt).putInt(s).array()
+        val aad = ByteBuffer.allocate(4).putInt(s).array()
+        return try {
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(k, "AES"), GCMParameterSpec(128, iv))
+            c.updateAAD(aad)
+            val ct = c.doFinal(pcm, 0, n)
+            ByteBuffer.allocate(6 + ct.size).put(1).put(sendDir).putInt(s).put(ct).array()
+        } catch (e: Exception) { null }
+    }
+
+    private fun openAudio(p: ByteArray): ByteArray? {
+        val k = key ?: return null
+        if (p.size < 6 + 16) return null
+        val dir = p[1]
+        if (dir == sendDir) return null // mon propre sens
+        val s = ByteBuffer.wrap(p, 2, 4).int
+        if (s <= lastRecvSeq - 50) return null // trop vieux
+        val iv = ByteBuffer.allocate(12).put(dir).put(salt).putInt(s).array()
+        val aad = ByteBuffer.allocate(4).putInt(s).array()
+        return try {
+            val c = Cipher.getInstance("AES/GCM/NoPadding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(k, "AES"), GCMParameterSpec(128, iv))
+            c.updateAAD(aad)
+            val out = c.doFinal(p, 6, p.size - 6)
+            if (s > lastRecvSeq) lastRecvSeq = s
+            out
+        } catch (e: Exception) { null }
     }
 
     /** Rend true si la trame concernait un appel. */
     fun handle(f: Frame, fromPeer: String): Boolean {
         if (f.type != Frame.CALL) return false
         val p = f.payload
+        val from = f.fromHex
         if (p.isNotEmpty() && p[0] == 1.toByte()) { // son
             val s = state.value
-            if (s.phase == CallState.ACTIVE && s.peerId == f.fromHex && playQueue.size < 50) playQueue.offer(p.copyOfRange(1, p.size))
+            if (s.phase == CallState.ACTIVE && s.peerId == from && playQueue.size < 50) openAudio(p)?.let { playQueue.offer(it) }
             return true
         }
-        val c = try { JSONObject(String(p)).optString("c") } catch (e: Exception) { return true }
-        val from = f.fromHex
+        val j = try { JSONObject(String(p)) } catch (e: Exception) { return true }
+        val c = j.optString("c")
         val s = state.value
         when (c) {
+            // Un voisin cherche un relais vers quelqu'un : je réponds si j'ai une prise Wi-Fi avec lui.
+            "probe" -> { val to = j.optString("to"); if (core.hasWifiLink(to)) sendJson(from, JSONObject().put("c", "probe_ok").put("to", to), null) }
+            "probe_ok" -> if (s.phase == CallState.SEARCHING && j.optString("to") == s.peerId) startOutgoing(s.peerId, s.peerName, from)
             "invite" -> {
-                if (s.phase != CallState.IDLE) { signal(from, "busy"); return true }
+                if (s.phase != CallState.IDLE) { sendJson(from, JSONObject().put("c", "busy"), j.optString("via").ifEmpty { null }); return true }
                 val name = db.contact(from)?.name ?: core.peer(from)?.name ?: "Inconnu"
-                state.value = CallState(CallState.RINGING_IN, from, name, System.currentTimeMillis())
+                val via = j.optString("via").ifEmpty { null }
+                // Le relais annoncé doit être celui par qui la trame est arrivée (sinon on répond en direct si possible).
+                val useVia = if (via != null && fromPeer == via) via else if (core.hasWifiLink(from)) null else fromPeer
+                salt = try { B64.dec(j.optString("salt")) } catch (e: Exception) { ByteArray(7) }
+                if (salt.size != 7) salt = ByteArray(7)
+                sendDir = 2; seq = 0; lastRecvSeq = -1
+                key = deriveKey(from)
+                if (key == null) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
+                val viaName = useVia?.let { db.contact(it)?.name ?: core.peer(it)?.name }
+                state.value = CallState(CallState.RINGING_IN, from, name, System.currentTimeMillis(), via = useVia, viaName = viaName)
                 ring(); notifyIncoming(name)
             }
             "accept" -> if (s.phase == CallState.RINGING_OUT && s.peerId == from) startAudio(s)
@@ -131,22 +230,23 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
             record?.startRecording()
             running.set(true)
             playQueue.clear()
-            // Lecture : un fil dédié, pour ne jamais bloquer la réception des autres trames.
+            // Lecture : fil dédié pour ne jamais bloquer la réception des autres trames.
             Thread {
                 while (running.get()) {
-                    val d = playQueue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                    val d = playQueue.poll(500, TimeUnit.MILLISECONDS) ?: continue
                     try { track?.write(d, 0, d.size) } catch (_: Exception) {}
                 }
             }.start()
+            // Capture : micro -> chiffrement -> réseau.
             Thread {
                 val buf = ByteArray(CHUNK)
                 val silence = ByteArray(CHUNK)
                 while (running.get()) {
                     val n = record?.read(buf, 0, CHUNK) ?: -1
                     if (n <= 0) continue
-                    val src = if (state.value.muted) silence else buf
-                    val payload = ByteArray(1 + n); payload[0] = 1; System.arraycopy(src, 0, payload, 1, n)
-                    core.sendTo(state.value.peerId, Frame(Frame.CALL, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(state.value.peerId), payload).encode())
+                    val st = state.value
+                    val payload = sealAudio(if (st.muted) silence else buf, n) ?: continue
+                    sendFrame(st.peerId, payload, st.via)
                 }
             }.start()
         } catch (e: Exception) { Log.e(tag, "audio", e); hangup() }
@@ -157,7 +257,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         stopRing()
         try { record?.stop(); record?.release() } catch (_: Exception) {}
         try { track?.stop(); track?.release() } catch (_: Exception) {}
-        record = null; track = null
+        record = null; track = null; key = null
         try { audio.mode = AudioManager.MODE_NORMAL; audio.isSpeakerphoneOn = false } catch (_: Exception) {}
         NotificationManagerCompat.from(ctx).cancel(NOTIF)
         state.value = CallState(CallState.IDLE, "", "", 0)

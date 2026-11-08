@@ -61,6 +61,14 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     fun sendText(chat: String, text: String) = sendMessage(chat, Message.TEXT, text.trim(), null)
     fun sendPhoto(chat: String, jpeg: ByteArray) = sendMessage(chat, Message.PHOTO, "", jpeg)
     fun sendVoice(chat: String, audio: ByteArray, seconds: Int) = sendMessage(chat, Message.VOICE, seconds.toString(), audio)
+    /** Vidéo courte : uniquement par Wi-Fi direct, un seul relais au maximum. */
+    fun sendVideo(chat: String, mp4: ByteArray, seconds: Int) = sendMessage(chat, Message.VIDEO, seconds.toString(), mp4, flags = Frame.FLAG_WIFI_ONLY, ttl = 2)
+
+    /** Peut-on envoyer une vidéo vers cette discussion maintenant ? (il faut une prise Wi-Fi direct) */
+    fun canSendVideo(chat: String): Boolean = when {
+        chat == Db.ALL || db.group(chat) != null -> core.wifiLinkedPeers().isNotEmpty()
+        else -> core.hasWifiLink(chat) || core.wifiLinkedPeers().isNotEmpty()
+    }
     fun sendLocation(chat: String, lat: Double, lon: Double) = sendMessage(chat, Message.LOC, "$lat,$lon", null)
 
     /** SOS : à tout le monde, prioritaire, avec ma position si on l'a. */
@@ -69,7 +77,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         sendMessage(Db.ALL, Message.SOS, body, null)
     }
 
-    private fun sendMessage(chat: String, kind: String, body: String, blob: ByteArray?) {
+    private fun sendMessage(chat: String, kind: String, body: String, blob: ByteArray?, flags: Int = 0, ttl: Int = Frame.DEFAULT_TTL) {
         val fid = Frame.newId()
         val mid = Hex.enc(fid)
         val time = System.currentTimeMillis()
@@ -77,17 +85,17 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val frame: Frame? = when {
             chat == Db.ALL -> {
                 val sig = Crypto.sign(me.sigPriv, fid + inner)
-                Frame(if (kind == Message.SOS) Frame.SOS else Frame.PUBLIC, Frame.DEFAULT_TTL, 0, 0, fid, core.myIdBytes(), Frame.BROADCAST, inner + sig)
+                Frame(if (kind == Message.SOS) Frame.SOS else Frame.PUBLIC, ttl, 0, flags, fid, core.myIdBytes(), Frame.BROADCAST, inner + sig)
             }
             db.group(chat) != null -> {
                 val g = db.group(chat)!!
-                Frame(Frame.GROUP, Frame.DEFAULT_TTL, 0, 0, fid, core.myIdBytes(), Frame.BROADCAST, Hex.dec(g.id) + Crypto.aesEncrypt(g.key, inner, fid))
+                Frame(Frame.GROUP, ttl, 0, flags, fid, core.myIdBytes(), Frame.BROADCAST, Hex.dec(g.id) + Crypto.aesEncrypt(g.key, inner, fid))
             }
             else -> {
                 val c = db.contact(chat) ?: cards[chat]?.let { Contact(it.id, it.name, it.dhPub, it.sigPub, 0, 0, 0) }
                 if (c == null) { event("Impossible d'écrire : contact inconnu"); return }
                 val to = Hex.dec(c.id)
-                Frame(Frame.DM, Frame.DEFAULT_TTL, 0, 0, fid, core.myIdBytes(), to, Crypto.sealFor(c.dhPub, inner, fid + core.myIdBytes() + to))
+                Frame(Frame.DM, ttl, 0, flags, fid, core.myIdBytes(), to, Crypto.sealFor(c.dhPub, inner, fid + core.myIdBytes() + to))
             }
         }
         val file = blob?.let { saveBlob(mid, kind, it) }
@@ -124,7 +132,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     }
 
     private fun saveBlob(mid: String, kind: String, blob: ByteArray): String {
-        val ext = when (kind) { Message.PHOTO -> "jpg"; Message.VOICE -> "m4a"; else -> "bin" }
+        val ext = when (kind) { Message.PHOTO -> "jpg"; Message.VOICE -> "m4a"; Message.VIDEO -> "mp4"; else -> "bin" }
         val f = File(mediaDir, "$mid.$ext"); f.writeBytes(blob); return f.absolutePath
     }
 
@@ -337,7 +345,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         db.saveMessage(Message(mid, chat, from, false, kind, body, file, inn.json.optLong("t", System.currentTimeMillis()), Message.DELIVERED, isOpen, route, senderName))
         db.touchContact(from)
         val preview = when (kind) {
-            Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal (${body}s)"; Message.LOC -> "📍 Position"; Message.SOS -> "🆘 SOS"; else -> body
+            Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal (${body}s)"; Message.VIDEO -> "🎬 Vidéo (${body}s)"; Message.LOC -> "📍 Position"; Message.SOS -> "🆘 SOS"; else -> body
         }
         val title = if (chat == Db.ALL) "$senderName · Tout le monde" else if (db.group(chat) != null) "$senderName · ${db.group(chat)?.name}" else senderName
         if (kind != Message.SOS && !isOpen) notify(title, preview, chat, false)

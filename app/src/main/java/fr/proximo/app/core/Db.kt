@@ -25,7 +25,7 @@ data class Message(
 ) {
     companion object {
         const val PENDING = 0; const val RELAYED = 1; const val DELIVERED = 2; const val FAILED = 3
-        const val TEXT = "text"; const val PHOTO = "photo"; const val VOICE = "voice"; const val LOC = "loc"; const val SOS = "sos"; const val SYS = "sys"
+        const val TEXT = "text"; const val PHOTO = "photo"; const val VOICE = "voice"; const val VIDEO = "video"; const val LOC = "loc"; const val SOS = "sos"; const val SYS = "sys"
     }
 }
 
