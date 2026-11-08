@@ -219,8 +219,10 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val type = if (data.size > 3) data[3].toInt() and 0xff else 0
         val flags = if (data.size > 6) data[6].toInt() and 0xff else 0
         // Appels, morceaux d'APK et trames marquées « Wi-Fi seulement » (vidéos) : uniquement par la prise Wi-Fi.
-        val apkBle = type == Frame.APK && (flags and Frame.FLAG_ALLOW_BLE) != 0
-        if (!apkBle && (type == Frame.CALL || type == Frame.APK || (flags and Frame.FLAG_WIFI_ONLY) != 0)) {
+        // Seuls les GROS morceaux d'APK sont réservés au Wi-Fi (sauf accord Bluetooth) ; les petits messages de contrôle
+        // de la mise à jour (offre, demande, accusés) passent par n'importe quelle liaison.
+        val apkBig = type == Frame.APK && data.size > 2000 && (flags and Frame.FLAG_ALLOW_BLE) == 0
+        if (type == Frame.CALL || apkBig || (flags and Frame.FLAG_WIFI_ONLY) != 0) {
             val t = transports.firstOrNull { it.name == Modes.WIFI } ?: return false
             return t.hasFastLink(peerId) && t.send(peerId, data)
         }

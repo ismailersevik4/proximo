@@ -199,8 +199,13 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
         val ids = core.connectedPeerIds()
         peerOffer.value = null
         settings.lastOfferedVersion = 0
-        for (id in ids) core.sendTo(id, Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(id), JSONObject().put("c", "ask").put("v", myCode).toString().toByteArray()).encode())
-        return ids.size
+        var sent = 0
+        for (id in ids) if (core.sendTo(id, Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(id), JSONObject().put("c", "ask").put("v", myCode).toString().toByteArray()).encode())) sent++
+        if (sent > 0) scope.launch {
+            delay(8000)
+            if (peerOffer.value == null && progress.value < 0) message.value = "Aucune version plus récente chez les voisins (ils ont la même version ou une plus ancienne)."
+        }
+        return sent
     }
 
     /** L'utilisateur accepte de récupérer la version du voisin. Sans Wi-Fi direct, on demande confirmation pour le Bluetooth. */
@@ -245,7 +250,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
                         peerOffer.value = UpdateInfo(v, j.optString("n"), f.fromHex, core.peer(f.fromHex)?.name)
                     }
                 }
-                "ask" -> if (j.optInt("v") < myCode) offerTo(f.fromHex, force = true)
+                "ask" -> if (j.optInt("v") < myCode) offerTo(f.fromHex, force = true) else core.sendTo(f.fromHex, Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), f.from, JSONObject().put("c", "same").put("v", myCode).toString().toByteArray()).encode())
+                "same" -> if (peerOffer.value == null) message.value = "${core.peer(f.fromHex)?.name ?: "Le voisin"} a la même version (${j.optInt("v")}) ou une plus ancienne."
                 "req" -> if (j.optInt("v") < myCode && settings.shareUpdates) {
                     val have = HashSet<Int>(); j.optJSONArray("have")?.let { a -> for (i in 0 until a.length()) have.add(a.getInt(i)) }
                     sendApk(f.fromHex, j.optBoolean("ble", false), have)
