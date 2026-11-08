@@ -37,6 +37,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import fr.proximo.app.BuildConfig
@@ -65,16 +66,33 @@ fun ProfileScreen(onContacts: () -> Unit, onSettings: () -> Unit) {
     val nbContacts by dbState(0) { it.acceptedContacts().size }
     val settings = remember { Settings.get(ctx) }
     val tick by settings.changes.collectAsState()
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val pickPhoto = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) scope.launch {
+            val b = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { fr.proximo.app.core.Avatars.fromUri(ctx, uri) }
+            if (b != null) { fr.proximo.app.core.Avatars.save(ctx, me.id, b); svc?.messenger?.sendAvatar(null); svc?.messenger?.event("Photo de profil mise à jour") }
+            else svc?.messenger?.event("Photo illisible")
+        }
+    }
+    var photoMenu by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().background(Px.Bg).verticalScroll(rememberScrollState()).padding(20.dp, 16.dp, 20.dp, 24.dp)) {
         Text("Profil", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(12.dp))
         Row(Modifier.fillMaxWidth().background(Px.Card, RoundedCornerShape(18.dp)).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Avatar(name, 60.dp, color = Px.Accent)
+            Box(Modifier.clickable { photoMenu = true }) {
+                Avatar(name, 64.dp, color = Px.Accent, id = me.id)
+                Box(Modifier.align(Alignment.BottomEnd).size(22.dp).background(Px.Bg, androidx.compose.foundation.shape.CircleShape), contentAlignment = Alignment.Center) { Text("📷", fontSize = 11.sp) }
+                androidx.compose.material3.DropdownMenu(photoMenu, { photoMenu = false }) {
+                    androidx.compose.material3.DropdownMenuItem(text = { Text("Choisir une photo") }, onClick = { photoMenu = false; pickPhoto.launch("image/*") })
+                    androidx.compose.material3.DropdownMenuItem(text = { Text("Retirer la photo") }, onClick = { photoMenu = false; fr.proximo.app.core.Avatars.remove(ctx, me.id); svc?.messenger?.sendAvatar(null) })
+                }
+            }
             Spacer(Modifier.width(14.dp))
             Column(Modifier.weight(1f)) {
                 Text(name, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Text("Mon code : ${me.shortCode}", color = Px.Muted, fontSize = 13.sp)
+                Text("Appuie sur la photo pour la changer", color = Px.Muted, fontSize = 11.sp)
             }
             TextButton(onClick = { editing = true }) { Text("Modifier") }
         }

@@ -188,8 +188,21 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         core.send(Frame(Frame.CARD_REQ, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), ByteArray(0)))
     }
 
-    /** Quand un voisin apparaît : on demande sa carte (clés publiques) pour pouvoir l'ajouter plus tard. */
-    fun onPeerAppeared(p: Peer) { if (!cards.containsKey(p.id)) askCard(p.id) }
+    /** Quand une liaison s'ouvre : on demande sa carte (clés publiques) si besoin, et on lui envoie ma photo de profil. */
+    fun onPeerAppeared(p: Peer) {
+        if (!cards.containsKey(p.id)) askCard(p.id)
+        sendAvatar(p.id)
+    }
+
+    /** Ma photo de profil vers un voisin (petit JPEG), ou vers tous les voisins connectés quand je la change. */
+    fun sendAvatar(peerId: String?) {
+        val mine = fr.proximo.app.core.Avatars.mine(ctx)
+        val payload = mine ?: ByteArray(0) // vide = « plus de photo »
+        val targets = if (peerId != null) listOf(peerId) else core.connectedPeerIds().toList()
+        for (t in targets) core.send(Frame(Frame.AVATAR, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(t), payload))
+    }
+    /** La photo a changé : prévenir l'interface et les voisins. */
+    val avatarsChanged = MutableStateFlow(0L)
 
     // ---- groupes ----
 
@@ -229,6 +242,11 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
             Frame.GROUP -> return onGroup(f)
             Frame.PUBLIC, Frame.SOS -> onPublic(f)
             Frame.ACK -> onAck(f)
+            Frame.AVATAR -> {
+                if (f.payload.isEmpty()) fr.proximo.app.core.Avatars.remove(ctx, f.fromHex)
+                else if (f.payload.size <= fr.proximo.app.core.Avatars.MAX_BYTES + 2000) fr.proximo.app.core.Avatars.save(ctx, f.fromHex, f.payload)
+                avatarsChanged.value = avatarsChanged.value + 1
+            }
         }
         return true
     }

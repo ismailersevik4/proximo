@@ -143,7 +143,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         Row(Modifier.fillMaxWidth().background(Px.Bar).padding(8.dp, 10.dp, 8.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
             if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Retour", tint = Color.White) } else Spacer(Modifier.width(8.dp))
             if (isAll) Box(Modifier.size(42.dp).background(Px.AccentDark, CircleShape), contentAlignment = Alignment.Center) { Text("👥", fontSize = 20.sp) }
-            else Avatar(title, 42.dp, online = if (group != null) null else peer != null, square = group != null)
+            else Avatar(title, 42.dp, online = if (group != null) null else peer != null, square = group != null, id = if (group != null) null else chat)
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)

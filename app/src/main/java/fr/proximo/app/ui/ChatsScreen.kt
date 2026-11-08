@@ -74,7 +74,7 @@ private fun ChatRow(c: ChatSummary, online: Boolean?, peers: List<fr.proximo.app
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (isAll) Box(Modifier.size(50.dp).background(Color.White.copy(alpha = 0.15f), CircleShape), contentAlignment = Alignment.Center) { Text("👥", fontSize = 22.sp) }
-        else Avatar(c.name, 50.dp, online = online, square = c.isGroup)
+        else Avatar(c.name, 50.dp, online = online, square = c.isGroup, id = if (c.isGroup) null else c.chat)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {

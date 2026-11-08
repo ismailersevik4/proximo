@@ -101,7 +101,7 @@ fun CallScreen(s: CallState) {
     Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
         Spacer(Modifier.height(40.dp))
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Avatar(s.peerName, 110.dp, color = Px.Avatar)
+            Avatar(s.peerName, 110.dp, color = Px.Avatar, id = s.peerId)
             Spacer(Modifier.height(18.dp))
             Text(s.peerName, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(6.dp))

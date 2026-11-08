@@ -63,8 +63,9 @@ class Frame(
         const val CALL = 11          // signalisation d'appel (direct uniquement)
         const val APK = 12           // partage de mise à jour (direct uniquement)
         const val PING = 13          // mesure de présence (direct uniquement)
+        const val AVATAR = 14        // ma photo de profil (direct uniquement)
 
-        val DIRECT_ONLY = setOf(HELLO, CARD_REQ, CARD, CALL, APK, PING)
+        val DIRECT_ONLY = setOf(HELLO, CARD_REQ, CARD, CALL, APK, PING, AVATAR)
         /** Drapeau : ne passer que par une prise Wi-Fi direct (vidéos, gros fichiers). */
         const val FLAG_WIFI_ONLY = 1
         val BROADCAST = ByteArray(8)

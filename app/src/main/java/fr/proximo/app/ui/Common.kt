@@ -10,6 +10,8 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.remember
+import androidx.compose.ui.draw.clip
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
@@ -56,12 +58,22 @@ fun dayLabel(t: Long): String {
 }
 
 @Composable
-fun Avatar(name: String?, size: Dp = 48.dp, online: Boolean? = null, square: Boolean = false, color: Color = Px.Avatar) {
+fun Avatar(name: String?, size: Dp = 48.dp, online: Boolean? = null, square: Boolean = false, color: Color = Px.Avatar, id: String? = null) {
+    val ctx = LocalContext.current
+    val tick by Db.get(ctx).changes.collectAsState()
+    val photo = remember(id, tick) { id?.let { fr.proximo.app.core.Avatars.fileIfExists(ctx, it) } }
+    val shape = if (square) RoundedCornerShape(size / 4) else CircleShape
     Box(contentAlignment = Alignment.Center) {
         Box(
-            Modifier.size(size).background(color, if (square) RoundedCornerShape(size / 4) else CircleShape).then(if (online == true) Modifier.border(2.dp, Px.Accent, if (square) RoundedCornerShape(size / 4) else CircleShape) else Modifier),
+            Modifier.size(size).background(color, shape).then(if (online == true) Modifier.border(2.dp, Px.Accent, shape) else Modifier).clip(shape),
             contentAlignment = Alignment.Center,
-        ) { Text(initials(name), color = Color.White, fontWeight = FontWeight.Bold, fontSize = (size.value / 3).sp) }
+        ) {
+            if (photo != null) coil.compose.AsyncImage(
+                model = coil.request.ImageRequest.Builder(ctx).data(photo).memoryCacheKey(photo.absolutePath + photo.lastModified()).diskCachePolicy(coil.request.CachePolicy.DISABLED).build(),
+                contentDescription = name, modifier = Modifier.size(size), contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+            )
+            else Text(initials(name), color = Color.White, fontWeight = FontWeight.Bold, fontSize = (size.value / 3).sp)
+        }
         if (online != null) Box(
             Modifier.align(Alignment.BottomEnd).size(size / 4).background(Px.Bg, CircleShape).border(2.dp, Px.Bg, CircleShape).background(if (online) Px.Accent else Px.Muted, CircleShape)
         )

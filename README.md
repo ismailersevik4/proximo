@@ -4,7 +4,7 @@ Messagerie Android **sans Internet** : les téléphones se parlent directement e
 
 Conçu et développé par **Ismail Ersevik**.
 
-## Ce que fait l'appli (version 1.1.2, APK 5)
+## Ce que fait l'appli (version 1.2.0, APK 6)
 
 - **Radar** : les téléphones Proximo à portée, avec distance approximative, ceux déjà en contact et les inconnus (« ? »).
 - **Contacts** : ajout depuis le radar, par QR code ou par code `PRX-XXXX-XXXX` (l'ajout se fait dès que les deux téléphones sont à portée).
@@ -15,6 +15,7 @@ Conçu et développé par **Ismail Ersevik**.
 - **Vidéos courtes** (15 s, 3,5 Mo max), uniquement par Wi-Fi direct, un relais au maximum.
 - **Messages en attente** : ce qui ne peut pas partir est gardé et part dès qu'un voisin apparaît.
 - **Mises à jour** depuis l'appli : par Internet (Releases GitHub) ou **de téléphone à téléphone** par Wi-Fi direct.
+- **Photos de profil** échangées entre téléphones, **notification vivante** (téléphones à portée, messages en attente).
 - Modes **Normal / Priorité portée / Priorité batterie**.
 
 Android 8 et plus. Interface en français.

@@ -105,7 +105,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                 item { Text("Demandes reçues", color = Px.Accent, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 6.dp)) }
                 items(incoming, key = { "in" + it.id }) { c ->
                     Row(Modifier.fillMaxWidth().background(Px.Card, RoundedCornerShape(14.dp)).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(c.name, 44.dp); Spacer(Modifier.width(12.dp))
+                        Avatar(c.name, 44.dp, id = c.id); Spacer(Modifier.width(12.dp))
                         Text(c.name, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                         IconButton(onClick = { svc?.messenger?.refuseContact(c.id) }) { Icon(Icons.Filled.Close, "Refuser", tint = Px.Muted) }
                         IconButton(onClick = { svc?.messenger?.acceptContact(c.id) }) { Icon(Icons.Filled.Check, "Accepter", tint = Px.Accent) }
@@ -119,7 +119,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                 item { Text("Demandes envoyées", color = Px.Muted, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 6.dp)) }
                 items(outgoing, key = { "out" + it.id }) { c ->
                     Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Avatar(c.name, 40.dp); Spacer(Modifier.width(12.dp))
+                        Avatar(c.name, 40.dp, id = c.id); Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) { Text(c.name, color = Color.White); Text(if (peers.any { it.id == c.id }) "À portée · en attente de sa réponse" else "Partira dès qu'il sera à portée", color = Px.Muted, fontSize = 12.sp) }
                         IconButton(onClick = { toDelete = c }) { Icon(Icons.Filled.Close, "Annuler", tint = Px.Muted) }
                     }
@@ -131,7 +131,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
             items(accepted, key = { it.id }) { c ->
                 val online = peers.any { it.id == c.id }
                 Row(Modifier.fillMaxWidth().clickable { onOpenChat(c.id) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Avatar(c.name, 46.dp, online = online); Spacer(Modifier.width(12.dp))
+                    Avatar(c.name, 46.dp, online = online, id = c.id); Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(c.name, color = Color.White, fontWeight = FontWeight.Bold)
                         Text(if (online) "À portée" else if (c.lastSeen > 0) "Vu ${timeStr(c.lastSeen)}" else "Jamais vu à portée", color = if (online) Px.AccentSoft else Px.Muted, fontSize = 12.sp)
@@ -171,7 +171,7 @@ fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
                 val on = c.id in selected.value
                 Row(Modifier.fillMaxWidth().clickable { selected.value = if (on) selected.value - c.id else selected.value + c.id }.padding(16.dp, 6.dp), verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(on, { selected.value = if (it) selected.value + c.id else selected.value - c.id })
-                    Avatar(c.name, 40.dp); Spacer(Modifier.width(12.dp)); Text(c.name, color = Color.White)
+                    Avatar(c.name, 40.dp, id = c.id); Spacer(Modifier.width(12.dp)); Text(c.name, color = Color.White)
                 }
             }
             if (contacts.isEmpty()) item { Text("Ajoute d'abord des contacts.", color = Px.Muted, modifier = Modifier.padding(16.dp)) }

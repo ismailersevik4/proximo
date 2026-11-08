@@ -16,6 +16,9 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.launch
 import fr.proximo.app.MainActivity
 import fr.proximo.app.R
 import fr.proximo.app.call.CallManager
@@ -25,12 +28,14 @@ import fr.proximo.app.msg.Messenger
 import fr.proximo.app.update.Updater
 
 /** Service de premier plan : fait tourner le réseau même appli fermée. */
+@OptIn(kotlinx.coroutines.FlowPreview::class)
 class MeshService : Service() {
     lateinit var core: MeshCore
     lateinit var messenger: Messenger
     lateinit var updater: Updater
     lateinit var calls: CallManager
     private var wakeLock: android.os.PowerManager.WakeLock? = null
+    private val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main)
 
     override fun onCreate() {
         super.onCreate()
@@ -65,6 +70,12 @@ class MeshService : Service() {
             addAction(WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED)
         }, ContextCompat.RECEIVER_NOT_EXPORTED)
         running.value = this
+        // Notification vivante : nombre de téléphones à portée et messages en attente.
+        scope.launch {
+            kotlinx.coroutines.flow.combine(core.peers, core.pendingCount) { p, n -> p.size to n }
+                .debounce(1500)
+                .collect { (nb, pending) -> try { getSystemService(NotificationManager::class.java).notify(NOTIF_ID, serviceNotification(nb, pending)) } catch (_: Exception) {} }
+        }
     }
 
     /** Bluetooth ou Wi-Fi rallumé ou éteint pendant que l'appli tourne : on relance le transport concerné. */
@@ -95,6 +106,7 @@ class MeshService : Service() {
     }
 
     override fun onDestroy() {
+        scope.cancel()
         try { wakeLock?.release() } catch (_: Exception) {}
         try { unregisterReceiver(radioReceiver) } catch (_: Exception) {}
         try { core.stop() } catch (_: Exception) {}
@@ -107,12 +119,17 @@ class MeshService : Service() {
 
     fun updateMode(mode: Int) { core.setMode(mode) }
 
-    private fun serviceNotification(): Notification {
+    private fun serviceNotification(nb: Int = -1, pending: Int = 0): Notification {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val text = when {
+            nb < 0 -> getString(R.string.notif_running)
+            nb == 0 -> "Personne à portée pour l'instant" + if (pending > 0) " · $pending message(s) en attente" else ""
+            else -> "$nb téléphone${if (nb > 1) "s" else ""} à portée" + if (pending > 0) " · $pending message(s) en attente" else ""
+        }
         return NotificationCompat.Builder(this, CH_SERVICE)
             .setSmallIcon(R.drawable.ic_notif)
-            .setContentTitle("Proximo")
-            .setContentText(getString(R.string.notif_running))
+            .setContentTitle("Proximo" + if (nb > 0) " · réseau actif" else "")
+            .setContentText(text)
             .setContentIntent(pi)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)

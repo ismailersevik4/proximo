@@ -41,6 +41,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
@@ -155,6 +157,11 @@ private fun Radar(peers: List<Peer>, contacts: List<Contact>, onTap: (Peer) -> U
     val initialsPaint = remember { Paint().apply { color = android.graphics.Color.WHITE; textAlign = Paint.Align.CENTER; isAntiAlias = true; isFakeBoldText = true } }
     val positions = remember { HashMap<String, Offset>() }
     val tapRadius = with(density) { 30.dp.toPx() }
+    val ctx = LocalContext.current
+    val tick by fr.proximo.app.core.Db.get(ctx).changes.collectAsState()
+    val photos = remember(peers, tick) {
+        peers.mapNotNull { p -> fr.proximo.app.core.Avatars.fileIfExists(ctx, p.id)?.let { f -> android.graphics.BitmapFactory.decodeFile(f.absolutePath)?.let { b -> p.id to b.asImageBitmap() } } }.toMap()
+    }
 
     Canvas(
         Modifier.fillMaxWidth(0.94f).aspectRatio(1f).pointerInput(peers) {
@@ -196,9 +203,13 @@ private fun Radar(peers: List<Peer>, contacts: List<Contact>, onTap: (Peer) -> U
             if (known) drawLine(accent.copy(alpha = 0.5f), c, pos, 1.5.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 14f)))
             val r = if (known) nodeR else smallR
             drawCircle(avatarColor, r, pos)
+            val photo = if (known) photos[p.id] else null
+            if (photo != null) {
+                val clip = Path().apply { addOval(androidx.compose.ui.geometry.Rect(pos.x - r, pos.y - r, pos.x + r, pos.y + r)) }
+                clipPath(clip) { drawImage(photo, dstOffset = androidx.compose.ui.unit.IntOffset((pos.x - r).toInt(), (pos.y - r).toInt()), dstSize = androidx.compose.ui.unit.IntSize((2 * r).toInt(), (2 * r).toInt())) }
+            }
             drawCircle(if (known) accent else muted, r, pos, style = Stroke(2.dp.toPx()))
-            val label = if (known) initials(contact?.name) else "?"
-            drawContext.canvas.nativeCanvas.drawText(label, pos.x, pos.y + 4.dp.toPx(), initialsPaint)
+            if (photo == null) drawContext.canvas.nativeCanvas.drawText(if (known) initials(contact?.name) else "?", pos.x, pos.y + 4.dp.toPx(), initialsPaint)
             val name = contact?.name ?: p.name
             val sub = buildString { if (name != null) append(name); if (m != null) append(" · $m m") else if (p.wifi) append(" · Wi-Fi") }
             if (sub.isNotEmpty()) drawContext.canvas.nativeCanvas.drawText(sub, pos.x, pos.y + r + 14.dp.toPx(), labelPaint)
