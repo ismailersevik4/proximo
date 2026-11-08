@@ -39,7 +39,6 @@ import java.util.concurrent.ConcurrentHashMap
  * et range dans la base ce qui arrive du réseau.
  */
 class Messenger(private val ctx: Context, private val core: MeshCore) {
-    companion object { const val PUBLIC_MAX_AGE = 5 * 60_000L }
     private val tag = "ProximoMsg"
     private val db = Db.get(ctx)
     private val me = Identity.get(ctx)
@@ -351,11 +350,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         if (known != null && !Crypto.verify(known, f.fid + inner, sig)) return
         val name = db.contact(from)?.name ?: inn.json.optString("n", "Inconnu")
         val kind = inn.json.optString("k")
-        // « Tout le monde » est un canal en direct : on n'affiche pas ce qui a plus de 5 minutes (les nouveaux venus ne voient
-        // que ce qui arrive après eux). Les SOS restent valables 1 heure.
-        val age = System.currentTimeMillis() - inn.json.optLong("t", System.currentTimeMillis())
-        if (kind != Message.SOS && age > PUBLIC_MAX_AGE) return
-        if (kind == Message.SOS && age > 3600_000L) return
+        // « Tout le monde » : tout le monde voit tout, sans limite de temps (les retardataires reçoivent ce qui attend chez les voisins).
         if (kind == Message.SOS) {
             store(f, Db.ALL, from, name, inn, Message.SOS)
             val o = Db.jsonObj(inn.json.optString("b"))
