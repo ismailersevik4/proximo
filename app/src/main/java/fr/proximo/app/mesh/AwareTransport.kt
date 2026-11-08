@@ -32,7 +32,8 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.TimeUnit
 
 /**
  * Transport Wi-Fi direct (Wi-Fi Aware / NAN).
@@ -65,7 +66,9 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         var name: String? = null
         var socket: Socket? = null
         var out: DataOutputStream? = null
-        val queue = LinkedBlockingQueue<ByteArray>()
+        val queue = LinkedBlockingDeque<ByteArray>()
+        var failures = 0
+        var nextTry = 0L
         var network: Network? = null
         var cb: ConnectivityManager.NetworkCallback? = null
         var connecting = false
@@ -106,6 +109,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
 
     override fun setMode(mode: Int) { this.mode = mode }
 
+    override fun hasFastLink(peerId: String): Boolean = peers[peerId]?.out != null
+
     override fun connectedPeers(): Set<String> = peers.values.filter { it.out != null || it.pubHandle != null || it.subHandle != null }.map { it.id }.toSet()
 
     /** Envoi : par la prise si elle est ouverte, sinon par petits messages (si la trame est courte). */
@@ -130,6 +135,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         session?.publish(cfg, object : DiscoverySessionCallback() {
             override fun onPublishStarted(s: PublishDiscoverySession) { pub = s }
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { onMsg(peerHandle, message, fromPublish = true) }
+            override fun onMessageSendFailed(messageId: Int) { onSendFailed() }
             override fun onSessionTerminated() { pub = null; if (running) handler.postDelayed({ publish() }, 3000) }
         }, handler)
     }
@@ -151,11 +157,19 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                 if (myId < id) requestDataPath(p)
             }
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { onMsg(peerHandle, message, fromPublish = false) }
+            override fun onMessageSendFailed(messageId: Int) { onSendFailed() }
             override fun onSessionTerminated() { sub = null; if (running) handler.postDelayed({ subscribe() }, 3000) }
         }, handler)
     }
 
-    private fun info(): ByteArray = Hex.dec(myId) + myName().toByteArray().take(24).toByteArray()
+    private fun info(): ByteArray {
+        var n = myName()
+        while (n.toByteArray().size > 24 && n.isNotEmpty()) n = n.dropLast(1)
+        return Hex.dec(myId) + n.toByteArray()
+    }
+    /** On ne sait pas quel pair a échoué : on redonne leur chance à tous les pairs sans prise. */
+    private fun onSendFailed() { for (p in peers.values) if (p.out == null) MeshService.instance?.core?.onDeliveryFailed(p.id) }
+
     private fun hello(): ByteArray = Frame(Frame.HELLO, 0, 0, 0, Frame.newId(), Hex.dec(myId), Frame.BROADCAST, myName().toByteArray()).encode()
 
     private fun onMsg(peerHandle: PeerHandle, message: ByteArray, fromPublish: Boolean) {
@@ -193,7 +207,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     private fun acceptDataPath(p: Peer) {
         if (Build.VERSION.SDK_INT < 29) return
         val s = pub ?: return; val h = p.subHandle ?: return
-        if (p.network != null || p.connecting) return
+        if (p.out != null || p.connecting || System.currentTimeMillis() < p.nextTry) return
         p.connecting = true
         val spec = WifiAwareNetworkSpecifier.Builder(s, h).setPskPassphrase(PSK).setPort(serverPort).build()
         request(p, spec, initiator = false)
@@ -203,13 +217,28 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     private fun requestDataPath(p: Peer) {
         if (Build.VERSION.SDK_INT < 29) return
         val s = sub ?: return; val h = p.pubHandle ?: return
-        if (p.out != null || p.connecting) return
+        if (p.out != null || p.connecting || System.currentTimeMillis() < p.nextTry) return
         p.connecting = true
         val spec = WifiAwareNetworkSpecifier.Builder(s, h).setPskPassphrase(PSK).build()
         request(p, spec, initiator = true)
     }
 
+    private fun releaseRequest(p: Peer) {
+        try { p.cb?.let { cm.unregisterNetworkCallback(it) } } catch (_: Exception) {}
+        p.cb = null; p.network = null
+    }
+
+    /** Échec d'ouverture : on attend de plus en plus longtemps (5 s, 15 s, 60 s) avant de réessayer tant que le pair est visible. */
+    private fun scheduleRetry(p: Peer) {
+        p.connecting = false
+        p.failures++
+        val wait = when (p.failures) { 1 -> 5_000L; 2 -> 15_000L; else -> 60_000L }
+        p.nextTry = System.currentTimeMillis() + wait
+        handler.postDelayed({ if (running && peers[p.id] === p && p.out == null) { if (myId < p.id) requestDataPath(p) else acceptDataPath(p) } }, wait + 100)
+    }
+
     private fun request(p: Peer, spec: WifiAwareNetworkSpecifier, initiator: Boolean) {
+        releaseRequest(p)
         val req = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI_AWARE).setNetworkSpecifier(spec).build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) { p.network = network }
@@ -224,15 +253,15 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                         val sock = network.socketFactory.createSocket()
                         sock.connect(InetSocketAddress(addr, port), 8000)
                         serve(sock, p)
-                    } catch (e: Exception) { Log.w(tag, "connexion prise", e); p.connecting = false }
+                    } catch (e: Exception) { Log.w(tag, "connexion prise", e); scheduleRetry(p) }
                 }
             }
-            override fun onLost(network: Network) { p.network = null; p.connecting = false; closeSocket(p) }
-            override fun onUnavailable() { p.connecting = false }
+            override fun onLost(network: Network) { closeSocket(p); if (p.cb === this) releaseRequest(p); scheduleRetry(p) }
+            override fun onUnavailable() { if (p.cb === this) releaseRequest(p); scheduleRetry(p) }
         }
         p.cb = cb
-        try { cm.requestNetwork(req, cb, handler) } catch (e: Exception) { p.connecting = false; Log.w(tag, "requête réseau", e) }
-        handler.postDelayed({ if (p.out == null) p.connecting = false }, 30_000)
+        try { cm.requestNetwork(req, cb, handler) } catch (e: Exception) { releaseRequest(p); scheduleRetry(p); Log.w(tag, "requête réseau", e) }
+        handler.postDelayed({ if (p.out == null && p.cb === cb) { releaseRequest(p); scheduleRetry(p) } }, 30_000)
     }
 
     /** Boucle d'une prise : on s'identifie, puis on lit les trames (longueur sur 4 octets + trame). */
@@ -250,12 +279,18 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             val p = peers.getOrPut(id) { Peer(id) }
             p.name = String(f.payload)
             closeSocket(p)
-            p.socket = sock; p.out = out; p.connecting = false
+            p.socket = sock; p.out = out; p.connecting = false; p.failures = 0; p.nextTry = 0L
             peer = p
             listener.onPeerSeen(id, p.name, name, 0)
             MeshService.instance?.core?.onLinkReady(id)
             exec.execute {
-                try { while (p.socket === sock) { val d = p.queue.take(); synchronized(out) { writeFrame(out, d) } } } catch (_: Exception) {}
+                try {
+                    while (p.socket === sock) {
+                        val d = p.queue.poll(1, TimeUnit.SECONDS) ?: continue
+                        if (p.socket !== sock) { p.queue.offerFirst(d); break }
+                        synchronized(out) { writeFrame(out, d) }
+                    }
+                } catch (_: Exception) {}
             }
             while (true) {
                 val data = readFrame(inp) ?: break
@@ -280,13 +315,14 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     }
 
     private fun closeSocket(p: Peer) {
+        val had = p.socket != null
         try { p.socket?.close() } catch (_: Exception) {}
         p.socket = null; p.out = null
+        if (had) { MeshService.instance?.core?.onDeliveryFailed(p.id); listener.onPeerSeen(p.id, p.name, name, 0) }
     }
     private fun closePeer(p: Peer) {
         closeSocket(p)
-        try { p.cb?.let { cm.unregisterNetworkCallback(it) } } catch (_: Exception) {}
-        p.cb = null; p.network = null
+        releaseRequest(p)
     }
 
     private val housekeeping = object : Runnable {
@@ -294,7 +330,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             if (!running) return
             val now = System.currentTimeMillis()
             for (p in peers.values.toList()) {
-                if (now - p.lastSeen > 120_000 && p.out == null) { closePeer(p); peers.remove(p.id); listener.onPeerLost(p.id, name) }
+                if (p.out != null) { p.lastSeen = now; listener.onPeerSeen(p.id, p.name, name, 0); continue }
+                if (now - p.lastSeen > 120_000) { closePeer(p); peers.remove(p.id); listener.onPeerLost(p.id, name) }
             }
             // Le pseudo peut avoir changé : on republie.
             if (pub != null) try { pub?.updatePublish(PublishConfig.Builder().setServiceName(SERVICE).setServiceSpecificInfo(info()).build()) } catch (_: Exception) {}

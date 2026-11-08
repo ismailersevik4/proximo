@@ -24,8 +24,10 @@ class MainActivity : ComponentActivity() {
 
     private val askPerms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
         permissionsOk = requiredPermissions().all { res[it] == true || ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
-        if (Identity.get(this).isReady) MeshService.start(this)
+        if (!permissionsOk) permissionsDeniedOnce = true
+        if (Identity.get(this).isReady && permissionsOk) MeshService.start(this)
     }
+    var permissionsDeniedOnce by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,18 +43,36 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        isForeground = true
+        permissionsOk = requiredPermissions().all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
         if (Identity.get(this).isReady && permissionsOk) MeshService.start(this)
         MeshService.instance?.updater?.retryPendingInstall()
     }
 
-    fun requestPermissions() { askPerms.launch(requiredPermissions().toTypedArray()) }
+    override fun onPause() { isForeground = false; super.onPause() }
 
+    /** Ouvre la fiche de l'appli dans les réglages Android (quand une autorisation a été refusée définitivement). */
+    fun openAppSettings() {
+        startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName")))
+    }
+
+    companion object { @Volatile var isForeground = false }
+
+    /** On demande tout d'un coup, mais seules les autorisations indispensables au réseau bloquent l'appli. */
+    fun requestPermissions() { askPerms.launch((requiredPermissions() + optionalPermissions()).distinct().toTypedArray()) }
+
+    /** Indispensables : sans elles, aucun téléphone ne peut être trouvé. */
     fun requiredPermissions(): List<String> {
         val l = ArrayList<String>()
         if (Build.VERSION.SDK_INT >= 31) { l += Manifest.permission.BLUETOOTH_SCAN; l += Manifest.permission.BLUETOOTH_ADVERTISE; l += Manifest.permission.BLUETOOTH_CONNECT }
+        else l += Manifest.permission.ACCESS_FINE_LOCATION // exigée par Android pour le scan Bluetooth avant Android 12
+        return l
+    }
+
+    /** Utiles mais pas bloquantes : Wi-Fi direct, notifications, position, micro. */
+    fun optionalPermissions(): List<String> {
+        val l = ArrayList<String>()
         if (Build.VERSION.SDK_INT >= 33) { l += Manifest.permission.NEARBY_WIFI_DEVICES; l += Manifest.permission.POST_NOTIFICATIONS }
-        // La position est exigée par Android pour le Bluetooth (avant Android 12) et le Wi-Fi direct (avant Android 13),
-        // et sert aussi au partage de position.
         l += Manifest.permission.ACCESS_FINE_LOCATION
         l += Manifest.permission.RECORD_AUDIO
         return l

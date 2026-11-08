@@ -47,9 +47,10 @@ import fr.proximo.app.mesh.Modes
 
 fun qrBitmap(text: String, size: Int = 600): Bitmap {
     val m = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size)
-    val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
-    for (x in 0 until size) for (y in 0 until size) bmp.setPixel(x, y, if (m[x, y]) 0xFF0B1220.toInt() else 0xFFFFFFFF.toInt())
-    return bmp
+    val px = IntArray(size * size)
+    val dark = 0xFF0B1220.toInt(); val light = 0xFFFFFFFF.toInt()
+    for (y in 0 until size) for (x in 0 until size) px[y * size + x] = if (m[x, y]) dark else light
+    return Bitmap.createBitmap(px, size, size, Bitmap.Config.RGB_565)
 }
 
 @Composable
@@ -58,7 +59,7 @@ fun ProfileScreen(onContacts: () -> Unit, onSettings: () -> Unit) {
     val me = remember { Identity.get(ctx) }
     var name by remember { mutableStateOf(me.name) }
     var editing by remember { mutableStateOf(false) }
-    val qr = remember(name) { qrBitmap(me.card().toQr()) }
+    val qr by androidx.compose.runtime.produceState<Bitmap?>(null, name) { value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { qrBitmap(me.card().toQr()) } }
     val svc by serviceState()
     val pending by dbState(0) { it.contacts().count { c -> c.status == 2 } }
     val nbContacts by dbState(0) { it.acceptedContacts().size }
@@ -79,7 +80,7 @@ fun ProfileScreen(onContacts: () -> Unit, onSettings: () -> Unit) {
         }
         Spacer(Modifier.height(14.dp))
         Column(Modifier.fillMaxWidth().background(Color.White, RoundedCornerShape(18.dp)).padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Image(qr.asImageBitmap(), "Mon QR code", Modifier.size(220.dp))
+            qr?.let { Image(it.asImageBitmap(), "Mon QR code", Modifier.size(220.dp)) } ?: androidx.compose.foundation.layout.Box(Modifier.size(220.dp))
             Spacer(Modifier.height(8.dp))
             Text("Fais scanner ce code pour être ajouté", color = Color(0xFF334155), fontSize = 13.sp, textAlign = TextAlign.Center)
         }

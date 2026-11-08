@@ -5,9 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.net.wifi.aware.WifiAwareManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -30,7 +33,6 @@ class MeshService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        running.value = this
         createChannels(this)
         goForeground(NOTIF_ID, serviceNotification())
         val me = Identity.get(this)
@@ -47,15 +49,35 @@ class MeshService : Service() {
         messenger = Messenger(this, core)
         updater = Updater(this, core)
         calls = CallManager(this, core)
-        core.handler = { f, from -> if (!calls.handle(f, from) && !updater.handle(f, from)) messenger.handle(f, from) }
-        core.onPeerChange = { p, appeared -> if (appeared) { messenger.onPeerAppeared(p); updater.onPeerAppeared(p) } }
+        core.handler = { f, from -> if (calls.handle(f, from) || updater.handle(f, from)) true else messenger.handle(f, from) }
+        // Dès qu'une liaison de données est ouverte : échange des cartes (clés) et offre de mise à jour.
+        core.onLinkUp = { p -> messenger.onPeerAppeared(p); updater.onPeerAppeared(p) }
         core.setMode(Settings.get(this).mode)
         core.start()
+        registerReceiver(radioReceiver, IntentFilter().apply {
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED)
+        })
+        running.value = this
+    }
+
+    /** Bluetooth ou Wi-Fi rallumé ou éteint pendant que l'appli tourne : on relance le transport concerné. */
+    private val radioReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    val st = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)
+                    if (st == BluetoothAdapter.STATE_ON || st == BluetoothAdapter.STATE_OFF) core.restart(Modes.BLE)
+                }
+                WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED -> core.restart(Modes.WIFI)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
+        try { unregisterReceiver(radioReceiver) } catch (_: Exception) {}
         try { core.stop() } catch (_: Exception) {}
         calls.hangup()
         running.value = null
@@ -94,10 +116,11 @@ class MeshService : Service() {
         val instance: MeshService? get() = running.value
 
         fun start(ctx: Context) {
-            if (!Identity.get(ctx).isReady) return
+            if (!Identity.get(ctx).isReady || Settings.get(ctx).stoppedManually) return
             try { ContextCompat.startForegroundService(ctx, Intent(ctx, MeshService::class.java)) } catch (e: Exception) { android.util.Log.w("Proximo", "démarrage du service", e) }
         }
-        fun stop(ctx: Context) { ctx.stopService(Intent(ctx, MeshService::class.java)) }
+        fun stop(ctx: Context) { Settings.get(ctx).stoppedManually = true; ctx.stopService(Intent(ctx, MeshService::class.java)) }
+        fun resume(ctx: Context) { Settings.get(ctx).stoppedManually = false; start(ctx) }
 
         fun createChannels(ctx: Context) {
             val nm = ctx.getSystemService(NotificationManager::class.java)

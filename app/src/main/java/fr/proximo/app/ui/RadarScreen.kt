@@ -121,7 +121,7 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
                         when { c?.accepted == true -> "Dans tes contacts"; c?.status == 0 -> "Demande envoyée, en attente"; c?.status == 2 -> "Il veut t'ajouter en contact"; else -> "Pas encore dans tes contacts" },
                         color = Px.AccentSoft,
                     )
-                    if (!canCall) { Spacer(Modifier.height(6.dp)); Text("Trop loin pour un appel en direct (il faut le Wi-Fi direct). Le talkie-walkie marche.", color = Px.Muted, fontSize = 12.sp) }
+                    if (!canCall) { Spacer(Modifier.height(6.dp)); Text("Pas d'appel en direct possible : il faut une liaison Wi-Fi direct ouverte entre vous deux. Le talkie-walkie marche.", color = Px.Muted, fontSize = 12.sp) }
                 }
             },
             confirmButton = {
@@ -184,7 +184,13 @@ private fun Radar(peers: List<Peer>, contacts: List<Contact>, onTap: (Peer) -> U
             val known = contact?.accepted == true
             val a = ((p.id.hashCode().toLong() and 0xffffL) % 360L).toDouble() * Math.PI / 180
             val m = p.meters
-            val dist = when { m != null -> (0.1f + 0.56f * (m / 100f).coerceAtMost(1f)); p.wifi -> 0.5f; else -> 0.8f }
+            // Anneaux : 30 m à 0,33 R, 100 m à 0,66 R, au-delà jusqu'à 0,9 R.
+            val dist = when {
+                m != null && m <= 30 -> 0.08f + 0.25f * (m / 30f)
+                m != null -> (0.33f + 0.33f * ((m - 30) / 70f)).coerceAtMost(0.9f)
+                p.wifi -> 0.5f
+                else -> 0.8f
+            }
             val pos = Offset(c.x + (R * dist * cos(a)).toFloat(), c.y + (R * dist * sin(a)).toFloat())
             positions[p.id] = pos
             if (known) drawLine(accent.copy(alpha = 0.5f), c, pos, 1.5.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 14f)))

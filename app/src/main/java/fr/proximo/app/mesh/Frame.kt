@@ -101,10 +101,11 @@ class Frame(
  *   'F' | fid(16) | index(2) | total(2) | morceau
  */
 object Fragmenter {
-    private const val HDR = 1 + 16 + 2 + 2
+    const val HDR = 1 + 16 + 2 + 2
 
     fun split(frame: ByteArray, maxChunk: Int): List<ByteArray> {
         if (frame.size <= maxChunk) return listOf(frame)
+        require(maxChunk > HDR) { "morceau trop petit" }
         val fid = frame.copyOfRange(7, 23)
         val body = maxChunk - HDR
         val total = (frame.size + body - 1) / body

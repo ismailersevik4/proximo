@@ -85,6 +85,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     val contact by dbState<fr.proximo.app.core.Contact?>(null) { it.contact(chat) }
     val messages by dbState(emptyList<Message>()) { it.messages(chat) }
     val peers by peersState()
+    val names by dbState(emptyMap<String, String>()) { d -> d.contacts().associate { c -> c.id to c.name } }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     var text by remember { mutableStateOf("") }
@@ -131,7 +132,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             if (!isAll) Icon(Icons.Filled.Lock, "Chiffré", tint = Px.Accent, modifier = Modifier.size(18.dp))
             if (!isAll && group == null) {
                 val can = svc?.calls?.canCall(chat) == true
-                IconButton(onClick = { if (can) svc?.calls?.call(chat) else svc?.messenger?.events?.value = "Trop loin pour un appel en direct : utilise le talkie-walkie" }) {
+                IconButton(onClick = { if (can) svc?.calls?.call(chat) else svc?.messenger?.event("Trop loin pour un appel en direct : utilise le talkie-walkie") }) {
                     Icon(Icons.Filled.Call, "Appeler", tint = if (can) Px.Accent else Px.Muted)
                 }
             }
@@ -139,7 +140,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             if (group != null) {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "Menu", tint = Color.White) }
                 DropdownMenu(menu, { menu = false }) {
-                    DropdownMenuItem(text = { Text("Membres : " + group!!.members.joinToString { m -> db.contact(m)?.name ?: if (m == svc?.core?.myId()) "moi" else "?" }) }, onClick = { menu = false })
+                    DropdownMenuItem(text = { Text("Membres : " + group!!.members.joinToString { m -> names[m] ?: if (m == svc?.core?.myId()) "moi" else "?" }) }, onClick = { menu = false })
                     DropdownMenuItem(text = { Text("Quitter le groupe", color = Px.Danger) }, onClick = { menu = false; svc?.messenger?.leaveGroup(chat); onBack?.invoke() })
                 }
             }
@@ -150,7 +151,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             itemsIndexed(messages, key = { _, m -> m.mid }) { i, m ->
                 val day = dayLabel(m.time)
                 if (i == 0 || dayLabel(messages[i - 1].time) != day) DaySeparator(day)
-                Bubble(m, showName = isAll || group != null, contactName = { id -> db.contact(id)?.name })
+                Bubble(m, showName = isAll || group != null, contactName = { id -> names[id] ?: peers.firstOrNull { it.id == id }?.name })
             }
             if (messages.isEmpty()) item {
                 Text(
@@ -180,7 +181,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                     DropdownMenuItem(text = { Text("Photo de la galerie") }, leadingIcon = { Icon(Icons.Filled.Image, null) }, onClick = { attach = false; pickImage.launch("image/*") })
                     DropdownMenuItem(text = { Text("Ma position") }, leadingIcon = { Icon(Icons.Filled.Place, null) }, onClick = {
                         attach = false
-                        scope.launch { val l = Locations.current(ctx); if (l != null) svc?.messenger?.sendLocation(chat, l.latitude, l.longitude) else svc?.messenger?.events?.value = "Position introuvable (GPS éteint ?)" }
+                        scope.launch { val l = Locations.current(ctx); if (l != null) svc?.messenger?.sendLocation(chat, l.latitude, l.longitude) else svc?.messenger?.event("Position introuvable (GPS éteint ?)") }
                     })
                 }
             }
@@ -202,8 +203,8 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                                 tryAwaitRelease()
                                 recording = false
                                 val r = recorder.stop()
-                                if (r != null) svc?.messenger?.sendVoice(chat, r.first, r.second) else svc?.messenger?.events?.value = "Trop court : maintiens le bouton en parlant"
-                            } else svc?.messenger?.events?.value = "Micro indisponible"
+                                if (r != null) svc?.messenger?.sendVoice(chat, r.first, r.second) else svc?.messenger?.event("Trop court : maintiens le bouton en parlant")
+                            } else svc?.messenger?.event("Micro indisponible")
                         })
                     },
                     contentAlignment = Alignment.Center,
@@ -222,6 +223,10 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             dismissButton = { TextButton(onClick = { sosDialog = false }) { Text("Annuler", color = Px.Muted) } },
         )
     }
+}
+
+fun openSafely(ctx: android.content.Context, intent: Intent) {
+    try { ctx.startActivity(intent) } catch (e: Exception) { MeshService.instance?.messenger?.event("Aucune application ne peut ouvrir ceci") }
 }
 
 @Composable
@@ -245,23 +250,23 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
     val shape = if (m.mine) RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp) else RoundedCornerShape(18.dp, 18.dp, 18.dp, 4.dp)
     Box(Modifier.fillMaxWidth().padding(vertical = 3.dp), contentAlignment = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart) {
         Column(Modifier.widthIn(max = 300.dp).background(bg, shape).padding(12.dp, 8.dp)) {
-            if (showName && !m.mine) Text(contactName(m.from) ?: "Inconnu", color = Px.Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            if (showName && !m.mine) Text(contactName(m.from) ?: m.senderName.ifEmpty { "Inconnu" }, color = Px.Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             when (m.kind) {
                 Message.PHOTO -> m.file?.let { AsyncImage(File(it), "Photo", modifier = Modifier.fillMaxWidth().height(200.dp).background(Px.Card, RoundedCornerShape(12.dp)).clickable {
                     val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", File(it))
-                    ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                    openSafely(ctx, Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                 }) }
                 Message.VOICE -> VoiceRow(m)
                 Message.LOC -> {
                     val parts = m.body.split(",")
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable {
-                        if (parts.size == 2) ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:${parts[0]},${parts[1]}?q=${parts[0]},${parts[1]}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        if (parts.size == 2) openSafely(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("geo:${parts[0]},${parts[1]}?q=${parts[0]},${parts[1]}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }) { Icon(Icons.Filled.Place, null, tint = Px.Accent); Spacer(Modifier.width(6.dp)); Text("Position partagée\nOuvrir dans Maps", color = Color.White, fontSize = 14.sp) }
                 }
                 Message.SOS -> {
                     val o = Db.jsonObj(m.body)
                     Text("🆘 SOS : " + o.optString("t", m.body), color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    if (o.has("lat")) Text("Voir la position", color = Px.Accent, fontSize = 14.sp, modifier = Modifier.clickable { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:${o.optDouble("lat")},${o.optDouble("lon")}?q=${o.optDouble("lat")},${o.optDouble("lon")}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) })
+                    if (o.has("lat")) Text("Voir la position", color = Px.Accent, fontSize = 14.sp, modifier = Modifier.clickable { openSafely(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("geo:${o.optDouble("lat")},${o.optDouble("lon")}?q=${o.optDouble("lat")},${o.optDouble("lon")}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) })
                 }
                 else -> Text(m.body, color = Color.White, fontSize = 15.sp)
             }

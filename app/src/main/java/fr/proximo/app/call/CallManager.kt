@@ -45,7 +45,10 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     private var ringtone: Ringtone? = null
     private val audio = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    fun canCall(peerId: String): Boolean = core.peer(peerId)?.wifi == true
+    /** Un appel exige une prise Wi-Fi direct ouverte avec le voisin (le Bluetooth est trop lent pour la voix). */
+    fun canCall(peerId: String): Boolean = core.hasWifiLink(peerId)
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val playQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
 
     fun call(peerId: String) {
         if (state.value.phase != CallState.IDLE) return
@@ -53,6 +56,8 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         val name = db.contact(peerId)?.name ?: core.peer(peerId)?.name ?: "Contact"
         state.value = CallState(CallState.RINGING_OUT, peerId, name, System.currentTimeMillis())
         signal(peerId, "invite")
+        // Pas de réponse en 45 s : on raccroche.
+        handler.postDelayed({ val st = state.value; if (st.phase == CallState.RINGING_OUT && st.peerId == peerId) { hangup(); MeshService.instance?.messenger?.event("Pas de réponse") } }, 45_000)
     }
 
     fun accept() {
@@ -89,7 +94,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         val p = f.payload
         if (p.isNotEmpty() && p[0] == 1.toByte()) { // son
             val s = state.value
-            if (s.phase == CallState.ACTIVE && s.peerId == f.fromHex) track?.write(p, 1, p.size - 1)
+            if (s.phase == CallState.ACTIVE && s.peerId == f.fromHex && playQueue.size < 50) playQueue.offer(p.copyOfRange(1, p.size))
             return true
         }
         val c = try { JSONObject(String(p)).optString("c") } catch (e: Exception) { return true }
@@ -103,7 +108,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                 ring(); notifyIncoming(name)
             }
             "accept" -> if (s.phase == CallState.RINGING_OUT && s.peerId == from) startAudio(s)
-            "reject", "busy" -> if (s.peerId == from) { endCall(); MeshService.instance?.messenger?.events?.value = if (c == "busy") "Occupé" else "Appel refusé" }
+            "reject", "busy" -> if (s.peerId == from) { endCall(); MeshService.instance?.messenger?.event(if (c == "busy") "Occupé" else "Appel refusé") }
             "hangup" -> if (s.peerId == from) endCall()
         }
         return true
@@ -125,6 +130,14 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
             record = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minIn, CHUNK * 4))
             record?.startRecording()
             running.set(true)
+            playQueue.clear()
+            // Lecture : un fil dédié, pour ne jamais bloquer la réception des autres trames.
+            Thread {
+                while (running.get()) {
+                    val d = playQueue.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                    try { track?.write(d, 0, d.size) } catch (_: Exception) {}
+                }
+            }.start()
             Thread {
                 val buf = ByteArray(CHUNK)
                 val silence = ByteArray(CHUNK)

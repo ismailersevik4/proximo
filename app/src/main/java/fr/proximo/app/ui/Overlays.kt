@@ -59,7 +59,7 @@ fun UpdateBanner(modifier: Modifier) {
         } else if (info != null) {
             val i = info!!
             Text(if (i.fromPeer != null) "${i.peerName ?: "Un voisin"} a Proximo ${i.name}" else "Mise à jour ${i.name} disponible", color = Color.White, fontWeight = FontWeight.Bold)
-            Text(if (i.fromPeer != null) "Récupérer la nouvelle version depuis son téléphone (Wi-Fi direct, quelques secondes) ?" else "Télécharger et installer la nouvelle version ? Tes contacts et messages sont conservés.", color = Px.Muted, fontSize = 13.sp)
+            Text(if (i.fromPeer != null) "Récupérer la nouvelle version depuis son téléphone par Wi-Fi direct (environ 15 Mo) ? Tes contacts et messages sont conservés." else "Télécharger et installer la nouvelle version ? Tes contacts et messages sont conservés.", color = Px.Muted, fontSize = 13.sp)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 TextButton(onClick = { up.dismiss() }) { Text("Plus tard", color = Px.Muted) }
                 TextButton(onClick = { if (i.fromPeer != null) up.requestFromPeer(i.fromPeer) else up.downloadAndInstall(); up.available.value = null }) { Text("Installer", fontWeight = FontWeight.Bold) }
@@ -74,11 +74,11 @@ fun UpdateBanner(modifier: Modifier) {
 fun EventToast(modifier: Modifier) {
     val svc by serviceState()
     val events = svc?.messenger?.events ?: return
-    val text by events.collectAsState()
-    val t = text ?: return
-    LaunchedEffect(t) { delay(3500); if (events.value == t) events.value = null }
+    val ev by events.collectAsState()
+    val e = ev ?: return
+    LaunchedEffect(e) { delay(3500); if (events.value == e) events.value = null }
     Box(modifier.padding(horizontal = 24.dp).background(Px.Card2, RoundedCornerShape(999.dp)).clickable { events.value = null }.padding(16.dp, 10.dp)) {
-        Text(t, color = Color.White, fontSize = 14.sp, textAlign = TextAlign.Center)
+        Text(e.text, color = Color.White, fontSize = 14.sp, textAlign = TextAlign.Center)
     }
 }
 
@@ -104,7 +104,7 @@ fun CallScreen(s: CallState) {
                 }, color = Px.AccentSoft, fontSize = 16.sp,
             )
             Spacer(Modifier.height(10.dp))
-            Text("Appel chiffré, en direct entre les deux téléphones (bêta). Si la liaison se dégrade, utilise le talkie-walkie.", color = Px.Muted, fontSize = 12.sp, textAlign = TextAlign.Center)
+            Text("Appel en direct entre les deux téléphones par Wi-Fi direct (bêta, pas encore chiffré). Si la liaison se dégrade, utilise le talkie-walkie.", color = Px.Muted, fontSize = 12.sp, textAlign = TextAlign.Center)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(28.dp), verticalAlignment = Alignment.CenterVertically) {
             if (s.phase == CallState.ACTIVE) {

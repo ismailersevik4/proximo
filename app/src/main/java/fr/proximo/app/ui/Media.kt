@@ -12,7 +12,6 @@ import android.os.Build
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
@@ -85,7 +84,7 @@ object Locations {
             val provider = when { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER; lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER; else -> return last }
             return try {
                 suspendCancellableCoroutine { cont ->
-                    lm.getCurrentLocation(provider, null, Executors.newSingleThreadExecutor()) { loc -> if (cont.isActive) cont.resume(loc ?: last) }
+                    lm.getCurrentLocation(provider, null, androidx.core.content.ContextCompat.getMainExecutor(ctx)) { loc -> if (cont.isActive) cont.resume(loc ?: last) }
                 }
             } catch (e: Exception) { last }
         }

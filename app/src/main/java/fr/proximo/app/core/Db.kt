@@ -20,6 +20,8 @@ data class Group(val id: String, val name: String, val key: ByteArray, val owner
 data class Message(
     val mid: String, val chat: String, val from: String, val mine: Boolean, val kind: String,
     val body: String, val file: String?, val time: Long, val status: Int, val read: Boolean, val route: String,
+    /** Pseudo de l'expéditeur tel qu'il s'est présenté (utile pour « Tout le monde » et les non-contacts). */
+    val senderName: String = "",
 ) {
     companion object {
         const val PENDING = 0; const val RELAYED = 1; const val DELIVERED = 2; const val FAILED = 3
@@ -32,7 +34,7 @@ data class ChatSummary(val chat: String, val name: String, val last: Message?, v
 /** Trame rangée en attente (pas encore remise ou à relayer plus tard). */
 data class Outbox(val fid: String, val data: ByteArray, val dest: String, val created: Long, val sentTo: MutableSet<String>, val mine: Boolean)
 
-class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 1) {
+class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 2) {
     /** Compteur qui change à chaque écriture : l'interface se rafraîchit en l'observant. */
     val changes = MutableStateFlow(0L)
     private fun bump() { changes.value = changes.value + 1 }
@@ -41,13 +43,15 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         db.execSQL("CREATE TABLE contacts(id TEXT PRIMARY KEY, name TEXT, dh BLOB, sg BLOB, status INTEGER, added INTEGER, last_seen INTEGER)")
         db.execSQL("CREATE TABLE pending_codes(code TEXT PRIMARY KEY, added INTEGER)")
         db.execSQL("CREATE TABLE groups(id TEXT PRIMARY KEY, name TEXT, key BLOB, owner TEXT, members TEXT, created INTEGER)")
-        db.execSQL("CREATE TABLE messages(mid TEXT PRIMARY KEY, chat TEXT, from_id TEXT, mine INTEGER, kind TEXT, body TEXT, file TEXT, time INTEGER, status INTEGER, read INTEGER, route TEXT)")
+        db.execSQL("CREATE TABLE messages(mid TEXT PRIMARY KEY, chat TEXT, from_id TEXT, mine INTEGER, kind TEXT, body TEXT, file TEXT, time INTEGER, status INTEGER, read INTEGER, route TEXT, sender_name TEXT DEFAULT '')")
         db.execSQL("CREATE INDEX idx_msg_chat ON messages(chat, time)")
         db.execSQL("CREATE TABLE seen(fid TEXT PRIMARY KEY, t INTEGER)")
         db.execSQL("CREATE TABLE outbox(fid TEXT PRIMARY KEY, data BLOB, dest TEXT, created INTEGER, sent_to TEXT, mine INTEGER)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
     }
-    override fun onUpgrade(db: SQLiteDatabase, o: Int, n: Int) {}
+    override fun onUpgrade(db: SQLiteDatabase, o: Int, n: Int) {
+        if (o < 2) db.execSQL("ALTER TABLE messages ADD COLUMN sender_name TEXT DEFAULT ''")
+    }
 
     // ---------- contacts ----------
     fun contacts(): List<Contact> = q("SELECT * FROM contacts ORDER BY name COLLATE NOCASE") { readContact(it) }
@@ -98,12 +102,12 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     fun messages(chat: String, limit: Int = 500): List<Message> =
         q("SELECT * FROM messages WHERE chat=? ORDER BY time DESC LIMIT $limit", chat) { readMsg(it) }.asReversed()
     fun message(mid: String): Message? = q("SELECT * FROM messages WHERE mid=?", mid) { readMsg(it) }.firstOrNull()
-    private fun readMsg(c: Cursor) = Message(c.getString(0), c.getString(1), c.getString(2), c.getInt(3) == 1, c.getString(4), c.getString(5), c.getString(6), c.getLong(7), c.getInt(8), c.getInt(9) == 1, c.getString(10) ?: "")
+    private fun readMsg(c: Cursor) = Message(c.getString(0), c.getString(1), c.getString(2), c.getInt(3) == 1, c.getString(4), c.getString(5), c.getString(6), c.getLong(7), c.getInt(8), c.getInt(9) == 1, c.getString(10) ?: "", c.getString(11) ?: "")
 
     fun saveMessage(m: Message) {
         val cv = ContentValues().apply {
             put("mid", m.mid); put("chat", m.chat); put("from_id", m.from); put("mine", if (m.mine) 1 else 0); put("kind", m.kind)
-            put("body", m.body); put("file", m.file); put("time", m.time); put("status", m.status); put("read", if (m.read) 1 else 0); put("route", m.route)
+            put("body", m.body); put("file", m.file); put("time", m.time); put("status", m.status); put("read", if (m.read) 1 else 0); put("route", m.route); put("sender_name", m.senderName)
         }
         writableDatabase.insertWithOnConflict("messages", null, cv, SQLiteDatabase.CONFLICT_REPLACE); bump()
     }

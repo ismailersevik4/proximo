@@ -9,6 +9,7 @@ import fr.proximo.app.core.Outbox
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -51,23 +52,29 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     val status = MutableStateFlow<Map<String, TransportStatus>>(emptyMap())
     val pendingCount = MutableStateFlow(0)
 
-    /** Celui qui reçoit ce qui m'est destiné (la messagerie). */
-    var handler: ((Frame, String) -> Unit)? = null
-    /** Prévenu quand un voisin apparaît ou disparaît (mise à jour, appels). */
+    /** Celui qui reçoit ce qui m'est destiné (la messagerie). Rend true si la trame a été traitée. */
+    var handler: ((Frame, String) -> Boolean)? = null
+    /** Prévenu quand un voisin apparaît ou disparaît (radar). */
     var onPeerChange: ((Peer, Boolean) -> Unit)? = null
+    /** Prévenu quand une liaison de données est ouverte avec un voisin (on peut lui parler directement). */
+    var onLinkUp: ((Peer) -> Unit)? = null
 
     fun start() {
         transports.forEach { it.start() }
         scope.launch {
             while (true) { delay(30_000); flush(); expirePeers(); db.purgeOld(); pendingCount.value = db.outboxCount() }
         }
-        pendingCount.value = db.outboxCount()
+        scope.launch { pendingCount.value = db.outboxCount() }
     }
-    fun stop() { transports.forEach { it.stop() } }
+    fun stop() { scope.cancel(); transports.forEach { it.stop() } }
     fun setMode(mode: Int) { transports.forEach { it.setMode(mode) } }
+    /** Relance un transport (Bluetooth ou Wi-Fi rallumé). */
+    fun restart(name: String) { transports.filter { it.name == name }.forEach { t -> try { t.stop() } catch (_: Exception) {}; try { t.start() } catch (e: Exception) { Log.w(tag, "relance $name", e) } } }
 
     fun peer(id: String): Peer? = peerMap[id]
     fun connectedPeerIds(): Set<String> = transports.flatMap { it.connectedPeers() }.toSet()
+    /** Vrai si une prise Wi-Fi direct (gros débit) est ouverte avec ce voisin. */
+    fun hasWifiLink(peerId: String): Boolean = transports.any { it.name == Modes.WIFI && it.hasFastLink(peerId) }
 
     // ---------------- transports -> cœur ----------------
     override fun onPeerSeen(peerId: String, name: String?, transport: String, rssi: Int) {
@@ -84,7 +91,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         )
         peerMap[peerId] = p
         publishPeers()
-        if (old == null) { db.touchContact(peerId); onPeerChange?.invoke(p, true) }
+        if (old == null) { scope.launch { db.touchContact(peerId) }; onPeerChange?.invoke(p, true) }
     }
 
     override fun onPeerLost(peerId: String, transport: String) {
@@ -103,17 +110,32 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         scope.launch { receive(f, peerId) }
     }
 
-    /** Une liaison de données vient de s'ouvrir : on envoie tout de suite ce qui attend. */
+    /** Une liaison de données vient de s'ouvrir : on envoie tout de suite ce qui attend, et on prévient la messagerie. */
     fun onLinkReady(peerId: String) {
-        peerMap[peerId]?.let { peerMap[peerId] = it.copy(linked = true, lastSeen = System.currentTimeMillis()); publishPeers() }
-        scope.launch { flush() }
+        val p = (peerMap[peerId] ?: Peer(peerId, db.contact(peerId)?.name, System.currentTimeMillis(), false, false, 0, true)).copy(linked = true, lastSeen = System.currentTimeMillis())
+        peerMap[peerId] = p
+        publishPeers()
+        scope.launch { delay(300); onLinkUp?.invoke(p); flush() }
+    }
+
+    /** Une liaison est tombée alors que des trames étaient en cours d'envoi : elles seront renvoyées à ce voisin. */
+    fun onDeliveryFailed(peerId: String) {
+        scope.launch {
+            lock.withLock {
+                for (o in db.outbox()) if (o.sentTo.remove(peerId)) db.outboxSentTo(o.fid, o.sentTo)
+            }
+        }
     }
 
     private fun publishPeers() { peers.value = peerMap.values.sortedBy { it.name ?: it.id } }
 
     private fun expirePeers() {
         val now = System.currentTimeMillis()
-        for (p in peerMap.values.toList()) if (now - p.lastSeen > 150_000) { peerMap.remove(p.id); onPeerChange?.invoke(p, false) }
+        val connected = connectedPeerIds()
+        for (p in peerMap.values.toList()) {
+            if (p.id in connected) { peerMap[p.id] = p.copy(lastSeen = now, linked = true); continue }
+            if (now - p.lastSeen > 150_000) { peerMap.remove(p.id); onPeerChange?.invoke(p, false) }
+        }
         publishPeers()
     }
 
@@ -124,13 +146,15 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val now = System.currentTimeMillis()
         if (f.relayable) {
             if (recentSeen.containsKey(fid) || db.seen(fid)) return
-            recentSeen[fid] = now; db.markSeen(fid)
             if (recentSeen.size > 5000) recentSeen.entries.removeAll { now - it.value > 600_000 }
         }
         val forMe = f.isBroadcast || f.toHex == me.id
+        var handled = true
         if (forMe) {
-            try { handler?.invoke(f, fromPeer) } catch (e: Exception) { Log.e(tag, "traitement", e) }
+            handled = try { handler?.invoke(f, fromPeer) ?: true } catch (e: Exception) { Log.e(tag, "traitement", e); true }
         }
+        // Dédoublonnage : une trame pour moi que je n'ai pas pu traiter (clé pas encore reçue) pourra être rejouée.
+        if (f.relayable && (handled || !forMe || f.isBroadcast)) { recentSeen[fid] = now; db.markSeen(fid) }
         // Un accusé de réception vide les files d'attente de tous les relais.
         if (f.type == Frame.ACK && f.payload.size >= 16) db.removeOutbox(Hex.enc(f.payload.copyOfRange(0, 16)))
         // Relais : tout ce qui est relayable et pas uniquement pour moi, tant qu'il reste des sauts.
@@ -146,10 +170,13 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     /** Envoie une trame de ma part : elle part vers tous les voisins et reste en attente pour les suivants. */
     fun send(f: Frame) {
         val fid = f.fidHex
-        recentSeen[fid] = System.currentTimeMillis(); db.markSeen(fid)
+        recentSeen[fid] = System.currentTimeMillis()
         scope.launch {
+            db.markSeen(fid)
             if (f.relayable) {
-                val o = Outbox(fid, f.encode(), f.toHex, System.currentTimeMillis(), HashSet(), mine = true)
+                // Les trames « techniques » (accusés, demandes de contact) sont retirées dès qu'elles sont remises au destinataire.
+                val technical = f.type == Frame.ACK || f.type == Frame.CONTACT_REQ || f.type == Frame.CONTACT_ACCEPT
+                val o = Outbox(fid, f.encode(), f.toHex, System.currentTimeMillis(), HashSet(), mine = !technical)
                 lock.withLock { db.saveOutbox(o) }
                 flush()
             } else {
@@ -164,6 +191,12 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
 
     /** Envoi direct (sans relais ni attente) : vrai si un transport a pris la trame. */
     fun sendTo(peerId: String, data: ByteArray): Boolean {
+        val type = if (data.size > 3) data[3].toInt() and 0xff else 0
+        // Appels et morceaux d'APK : uniquement par la prise Wi-Fi (le Bluetooth est bien trop lent).
+        if (type == Frame.CALL || type == Frame.APK) {
+            val t = transports.firstOrNull { it.name == Modes.WIFI } ?: return false
+            return t.hasFastLink(peerId) && t.send(peerId, data)
+        }
         // Wi-Fi d'abord pour les grosses trames, Bluetooth d'abord pour les petites.
         val ordered = if (data.size > 600) transports.sortedByDescending { it.name == Modes.WIFI } else transports.sortedByDescending { it.name == Modes.BLE }
         for (t in ordered) if (t.connectedPeers().contains(peerId) && t.send(peerId, data)) return true
@@ -185,8 +218,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
                 if (sendTo(p, o.data)) { o.sentTo.add(p); changed = true; MeshService.instance?.messenger?.onRelayed(o, p) }
             }
             if (changed) db.outboxSentTo(o.fid, o.sentTo)
-            // Un message direct remis en main propre au destinataire n'a plus besoin d'attendre.
-            if (isDirect && o.dest in o.sentTo && o.dest in connected && !o.mine) db.removeOutbox(o.fid)
+            // Une trame directe remise au destinataire (relais ou trame technique) n'a plus besoin d'attendre.
+            if (isDirect && o.dest in o.sentTo && !o.mine) db.removeOutbox(o.fid)
         }
         pendingCount.value = db.outboxCount()
     }

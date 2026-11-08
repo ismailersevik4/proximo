@@ -40,6 +40,16 @@ class Settings private constructor(ctx: Context) {
         get() = p.getBoolean("shareUpdates", true)
         set(v) { p.edit().putBoolean("shareUpdates", v).apply(); bump() }
 
+    /** Réseau arrêté à la main depuis les réglages (ne pas relancer tout seul). */
+    var stoppedManually: Boolean
+        get() = p.getBoolean("stopped", false)
+        set(v) { p.edit().putBoolean("stopped", v).apply(); bump() }
+
+    /** Heure du dernier « Plus tard » sur une offre de mise à jour. */
+    var lastOfferedAt: Long
+        get() = p.getLong("lastOfferedAt", 0L)
+        set(v) { p.edit().putLong("lastOfferedAt", v).apply() }
+
     /** Dernière version proposée (pour ne pas redemander). */
     var lastOfferedVersion: Int
         get() = p.getInt("lastOffered", 0)

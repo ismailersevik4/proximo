@@ -57,7 +57,7 @@ fun ChatsScreen(onOpen: (String) -> Unit, onNewGroup: () -> Unit, onAdd: () -> U
         LazyColumn(Modifier.fillMaxSize()) {
             items(chats, key = { it.chat }) { c ->
                 val online = if (c.isGroup) null else peers.any { it.id == c.chat }
-                ChatRow(c, online, onClick = { onOpen(c.chat) })
+                ChatRow(c, online, peers, onClick = { onOpen(c.chat) })
             }
             if (chats.size <= 1) item {
                 Text("Ajoute des contacts depuis le radar (téléphones à portée), avec un QR code ou un code PRX.", color = Px.Muted, fontSize = 13.sp, modifier = Modifier.padding(20.dp, 24.dp))
@@ -67,7 +67,7 @@ fun ChatsScreen(onOpen: (String) -> Unit, onNewGroup: () -> Unit, onAdd: () -> U
 }
 
 @Composable
-private fun ChatRow(c: ChatSummary, online: Boolean?, onClick: () -> Unit) {
+private fun ChatRow(c: ChatSummary, online: Boolean?, peers: List<fr.proximo.app.mesh.Peer>, onClick: () -> Unit) {
     val isAll = c.chat == Db.ALL
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp).background(if (isAll) Px.AccentDark else Color.Transparent, RoundedCornerShape(16.dp)).clickable(onClick = onClick).padding(10.dp, 10.dp),
@@ -86,7 +86,7 @@ private fun ChatRow(c: ChatSummary, online: Boolean?, onClick: () -> Unit) {
                 val m = c.last
                 val preview = when {
                     m == null -> if (isAll) "Parle à tous les téléphones autour de toi" else "Aucun message"
-                    m.status == Message.PENDING && m.mine -> "⏳ En attente · hors de portée"
+                    m.status == Message.PENDING && m.mine -> if (peers.isEmpty()) "⏳ En attente · personne à portée" else "⏳ En attente d'envoi"
                     else -> (if (m.mine) "Toi : " else "") + when (m.kind) {
                         Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal · ${m.body}s"; Message.LOC -> "📍 Position partagée"; Message.SOS -> "🆘 SOS"; else -> m.body
                     }

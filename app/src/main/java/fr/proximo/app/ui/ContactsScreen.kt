@@ -73,7 +73,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
     val scan = rememberLauncherForActivityResult(ScanContract()) { r ->
         val t = r.contents ?: return@rememberLauncherForActivityResult
         val card = Card.fromQr(t)
-        if (card != null) svc?.messenger?.addFromCard(card) else svc?.messenger?.events?.value = "Ce QR code n'est pas un code Proximo"
+        if (card != null) svc?.messenger?.addFromCard(card) else svc?.messenger?.event("Ce QR code n'est pas un code Proximo")
     }
     val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (ok) scan.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Vise le QR code Proximo de l'autre téléphone").setBeepEnabled(false).setOrientationLocked(true))
@@ -90,7 +90,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(code, { code = it.uppercase() }, modifier = Modifier.weight(1f), singleLine = true, placeholder = { Text("Code PRX-XXXX-XXXX", color = Px.Muted) }, keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters))
                     Spacer(Modifier.width(8.dp))
-                    TextButton(onClick = { if (svc?.messenger?.addByCode(code) == true) code = "" else svc?.messenger?.events?.value = "Code invalide" }) { Text("Ajouter") }
+                    TextButton(onClick = { if (svc?.messenger?.addByCode(code) == true) code = "" else svc?.messenger?.event("Code invalide") }) { Text("Ajouter") }
                 }
                 Text("Le code s'échange par SMS ou WhatsApp ; l'ajout se fait dès que vous êtes à portée l'un de l'autre.", color = Px.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
                 if (codes.isNotEmpty()) {

@@ -30,7 +30,7 @@ import android.util.Log
 import fr.proximo.app.core.Hex
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ConcurrentLinkedDeque
 
 /**
  * Transport Bluetooth basse consommation.
@@ -61,16 +61,18 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         var mtu = 23
         var ready = false
         val assembler = Fragmenter.Assembler()
-        val queue = ConcurrentLinkedQueue<ByteArray>()
+        val queue = ConcurrentLinkedDeque<ByteArray>()
         @Volatile var writing = false
         var lastSeen = System.currentTimeMillis()
         var rssi = 0
-        val chunk get() = (mtu - 3).coerceIn(20, 509)
+        val chunk get() = (mtu - 3).coerceIn(Fragmenter.HDR + 1, 509)
     }
 
     private val links = ConcurrentHashMap<String, Link>()          // par adresse
     private val seenAdv = ConcurrentHashMap<String, Long>()        // adresse -> dernière annonce
     private val idByAddress = ConcurrentHashMap<String, String>()  // adresse -> identifiant annoncé
+    private val lastNotified = ConcurrentHashMap<String, Pair<Long, Int>>() // adresse -> (heure, rssi) de la dernière remontée
+    private val connectFailures = ConcurrentHashMap<String, Pair<Int, Long>>() // adresse -> (échecs, heure du dernier)
 
     override fun start() {
         if (running) return
@@ -152,12 +154,22 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         val peerId = Hex.enc(sd)
         if (peerId == myId) return
         val addr = r.device.address
-        seenAdv[addr] = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        seenAdv[addr] = now
         idByAddress[addr] = peerId
-        links[addr]?.let { it.rssi = r.rssi; it.lastSeen = System.currentTimeMillis(); if (it.peerId == null) it.peerId = peerId }
-        listener.onPeerSeen(peerId, null, name, r.rssi)
-        // Le plus petit identifiant se connecte à l'autre.
-        if (myId < peerId && links[addr] == null) connectTo(r.device, peerId)
+        links[addr]?.let { it.rssi = r.rssi; it.lastSeen = now; if (it.peerId == null) it.peerId = peerId }
+        // On ne remonte pas chaque annonce (jusqu'à 10 par seconde) : toutes les 2 s ou si le signal a nettement bougé.
+        val last = lastNotified[addr]
+        if (last == null || now - last.first > 2000 || kotlin.math.abs(last.second - r.rssi) > 6) {
+            lastNotified[addr] = now to r.rssi
+            listener.onPeerSeen(peerId, null, name, r.rssi)
+        }
+        // Le plus petit identifiant se connecte à l'autre, avec un délai croissant après des échecs.
+        if (myId < peerId && links[addr] == null) {
+            val f = connectFailures[addr]
+            val wait = when (f?.first ?: 0) { 0 -> 0L; 1 -> 10_000L; 2 -> 30_000L; else -> 60_000L }
+            if (f == null || now - f.second > wait) connectTo(r.device, peerId)
+        }
     }
 
     // ---------------- côté client ----------------
@@ -168,7 +180,7 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         Log.i(tag, "connexion vers $peerId")
         val gatt = if (Build.VERSION.SDK_INT >= 23) device.connectGatt(ctx, false, clientCb, BluetoothDevice.TRANSPORT_LE) else device.connectGatt(ctx, false, clientCb)
         link.gatt = gatt
-        handler.postDelayed({ if (!link.ready && links[device.address] === link) dropLink(link) }, 20_000)
+        handler.postDelayed({ if (!link.ready && links[device.address] === link) { val f = connectFailures[device.address]; connectFailures[device.address] = ((f?.first ?: 0) + 1) to System.currentTimeMillis(); dropLink(link) } }, 20_000)
     }
 
     private val clientCb = object : BluetoothGattCallback() {
@@ -225,7 +237,12 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
     private fun dropLink(link: Link) {
         links.remove(link.address)
         try { link.gatt?.disconnect(); link.gatt?.close() } catch (_: Exception) {}
-        link.peerId?.let { id -> if (links.values.none { it.peerId == id && it.ready }) listener.onPeerLost(id, name) }
+        val pending = link.queue.isNotEmpty()
+        link.queue.clear()
+        link.peerId?.let { id ->
+            if (pending) MeshService.instance?.core?.onDeliveryFailed(id)
+            if (links.values.none { it.peerId == id && it.ready }) listener.onPeerLost(id, name)
+        }
     }
 
     // ---------------- côté serveur ----------------
@@ -268,8 +285,9 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
 
     // ---------------- envoi / réception ----------------
     private fun pump(link: Link) {
+        if (links[link.address] !== link) { link.queue.clear(); return }
         if (link.writing) return
-        val chunk = link.queue.poll() ?: return
+        val chunk = link.queue.peek() ?: return
         link.writing = true
         var ok = false
         try {
@@ -288,7 +306,8 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
                 }
             }
         } catch (e: Exception) { Log.w(tag, "écriture", e) }
-        if (!ok) { link.writing = false; handler.postDelayed({ pump(link) }, 50) }
+        if (ok) link.queue.poll() // le morceau est parti : on le retire ; sinon il reste en tête et sera retenté
+        else { link.writing = false; handler.postDelayed({ pump(link) }, 50) }
     }
 
     private fun incoming(address: String, chunk: ByteArray) {

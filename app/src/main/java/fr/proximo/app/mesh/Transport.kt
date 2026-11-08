@@ -22,6 +22,8 @@ interface Transport {
     fun connectedPeers(): Set<String>
     /** Change le mode (NORMAL / PORTEE / BATTERIE). */
     fun setMode(mode: Int)
+    /** Vrai si une liaison à gros débit (prise Wi-Fi) est ouverte avec ce voisin. */
+    fun hasFastLink(peerId: String): Boolean = false
 }
 
 object Modes {

@@ -21,7 +21,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,11 +43,12 @@ fun SettingsScreen(onBack: () -> Unit) {
 
     Column(Modifier.fillMaxSize().background(Px.Bg)) {
         ScreenHeader("Réglages", onBack)
-        key(tick) { Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+        if (tick < 0) return // lecture du compteur : l'écran se rafraîchit à chaque réglage changé
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
             Section("Mode de connexion") {
-                ModeRow("Normal", "Bluetooth en continu, Wi-Fi direct par impulsions. Portée maximale, batterie correcte.", settings.mode == Modes.NORMAL) { settings.mode = Modes.NORMAL; svc?.updateMode(Modes.NORMAL) }
-                ModeRow("Priorité portée", "Wi-Fi direct en continu : les voisins lointains apparaissent tout de suite. Consomme plus.", settings.mode == Modes.PORTEE) { settings.mode = Modes.PORTEE; svc?.updateMode(Modes.PORTEE) }
-                ModeRow("Priorité batterie", "Recherche moins fréquente. La portée baisse quand le téléphone est dans la poche.", settings.mode == Modes.BATTERIE) { settings.mode = Modes.BATTERIE; svc?.updateMode(Modes.BATTERIE) }
+                ModeRow("Normal", "Recherche Bluetooth équilibrée, Wi-Fi direct actif. Bon compromis portée / batterie.", settings.mode == Modes.NORMAL) { settings.mode = Modes.NORMAL; svc?.updateMode(Modes.NORMAL) }
+                ModeRow("Priorité portée", "Recherche Bluetooth rapide : les voisins apparaissent et se reconnectent plus vite. Consomme plus.", settings.mode == Modes.PORTEE) { settings.mode = Modes.PORTEE; svc?.updateMode(Modes.PORTEE) }
+                ModeRow("Priorité batterie", "Recherche Bluetooth lente et entretien Wi-Fi moins fréquent. Les voisins mettent plus de temps à apparaître.", settings.mode == Modes.BATTERIE) { settings.mode = Modes.BATTERIE; svc?.updateMode(Modes.BATTERIE) }
             }
             Spacer(Modifier.height(14.dp))
             Section("Messages") {
@@ -62,19 +62,24 @@ fun SettingsScreen(onBack: () -> Unit) {
                 SwitchRow("Partager ma version aux voisins", "Un voisin qui a une version plus ancienne peut récupérer l'appli depuis mon téléphone (Wi-Fi direct).", settings.shareUpdates) { settings.shareUpdates = it }
                 Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Text("Version installée", color = Color.White); Text("Appli ${BuildConfig.VERSION_NAME} · APK ${BuildConfig.VERSION_CODE}", color = Px.Muted, fontSize = 12.sp) }
-                    TextButton(onClick = { svc?.updater?.checkOnline(); svc?.messenger?.events?.value = "Vérification en cours…" }) { Text("Vérifier") }
+                    TextButton(onClick = { svc?.updater?.checkOnline(); svc?.messenger?.event("Vérification en cours…") }) { Text("Vérifier") }
                 }
             }
             Spacer(Modifier.height(14.dp))
             Section("Réseau") {
+                val stopped = settings.stoppedManually
                 Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) { Text("Arrêter le réseau", color = Color.White); Text("Coupe Bluetooth et Wi-Fi direct de Proximo jusqu'à la prochaine ouverture de l'appli.", color = Px.Muted, fontSize = 12.sp) }
-                    TextButton(onClick = { MeshService.stop(ctx) }) { Text("Arrêter", color = Px.Danger) }
+                    Column(Modifier.weight(1f)) {
+                        Text(if (stopped) "Réseau arrêté" else "Arrêter le réseau", color = if (stopped) Px.Warn else Color.White)
+                        Text(if (stopped) "Proximo ne cherche plus personne et ne reçoit rien. Appuie sur Démarrer pour reprendre." else "Coupe Bluetooth et Wi-Fi direct de Proximo jusqu'à ce que tu appuies sur Démarrer.", color = Px.Muted, fontSize = 12.sp)
+                    }
+                    if (stopped) TextButton(onClick = { MeshService.resume(ctx) }) { Text("Démarrer") }
+                    else TextButton(onClick = { MeshService.stop(ctx) }) { Text("Arrêter", color = Px.Danger) }
                 }
             }
             Spacer(Modifier.height(24.dp))
             Text("Proximo — conçu et développé par Ismail Ersevik", color = Px.Muted, fontSize = 12.sp, modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-        } }
+        }
     }
 }
 

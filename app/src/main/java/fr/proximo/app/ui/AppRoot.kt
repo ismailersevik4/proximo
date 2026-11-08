@@ -59,9 +59,9 @@ fun AppRoot(activity: MainActivity) {
     var ready by remember { mutableStateOf(identity.isReady) }
 
     if (!ready) { Onboarding(onDone = { name -> identity.name = name; ready = true; activity.requestPermissions() }); return }
-    if (!activity.permissionsOk) { PermissionsScreen(onAsk = { activity.requestPermissions() }); return }
+    if (!activity.permissionsOk) { PermissionsScreen(onAsk = { activity.requestPermissions() }, deniedOnce = activity.permissionsDeniedOnce, onSettings = { activity.openAppSettings() }); return }
 
-    LaunchedEffect(Unit) { MeshService.start(ctx); MeshService.instance?.updater?.checkOnline() }
+    LaunchedEffect(Unit) { MeshService.start(ctx) }
     val svc by serviceState()
     LaunchedEffect(svc) { svc?.updater?.checkOnline() }
 
@@ -143,7 +143,7 @@ fun Onboarding(onDone: (String) -> Unit) {
 }
 
 @Composable
-fun PermissionsScreen(onAsk: () -> Unit) {
+fun PermissionsScreen(onAsk: () -> Unit, deniedOnce: Boolean, onSettings: () -> Unit) {
     Column(Modifier.fillMaxSize().background(Px.Bg).padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Logo(90.dp)
         Spacer(Modifier.height(24.dp))
@@ -155,6 +155,12 @@ fun PermissionsScreen(onAsk: () -> Unit) {
         )
         Spacer(Modifier.height(24.dp))
         Button(onClick = onAsk, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Autoriser", fontWeight = FontWeight.Bold) }
+        if (deniedOnce) {
+            Spacer(Modifier.height(12.dp))
+            Text("Si Android ne te repose plus la question, ouvre les réglages de l'appli et autorise « Appareils à proximité » (ou Bluetooth / Position).", color = Px.Warn, fontSize = 13.sp, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(8.dp))
+            androidx.compose.material3.TextButton(onClick = onSettings) { Text("Ouvrir les réglages de l'appli") }
+        }
     }
 }
 

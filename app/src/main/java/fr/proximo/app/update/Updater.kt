@@ -104,6 +104,12 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
 
     private fun install(f: File) {
         if (!sameSignature(f)) { message.value = "Cette APK n'est pas signée avec la clé de Proximo : installation refusée"; f.delete(); return }
+        if (!fr.proximo.app.MainActivity.isForeground) {
+            // Android refuse d'ouvrir l'installateur depuis l'arrière-plan : on prévient, l'ouverture de l'appli lancera l'installation.
+            pendingInstall = f
+            notifyReady()
+            return
+        }
         if (!canInstall()) { message.value = "Autorise Proximo à installer des mises à jour (réglage Android), puis réessaie"; pendingInstall = f; askInstallPermission(); return }
         val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
         val i = Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
@@ -111,7 +117,18 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
         ctx.startActivity(i)
     }
     private var pendingInstall: File? = null
-    fun retryPendingInstall() { pendingInstall?.let { if (canInstall()) { pendingInstall = null; install(it) } } }
+    fun retryPendingInstall() { pendingInstall?.let { if (fr.proximo.app.MainActivity.isForeground) { pendingInstall = null; install(it) } } }
+
+    private fun notifyReady() {
+        try {
+            val i = Intent(ctx, fr.proximo.app.MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            val pi = android.app.PendingIntent.getActivity(ctx, 91, i, android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT)
+            val n = androidx.core.app.NotificationCompat.Builder(ctx, fr.proximo.app.mesh.MeshService.CH_MESSAGES)
+                .setSmallIcon(fr.proximo.app.R.drawable.ic_notif).setContentTitle("Mise à jour de Proximo prête").setContentText("Appuie pour l'installer")
+                .setAutoCancel(true).setContentIntent(pi).build()
+            androidx.core.app.NotificationManagerCompat.from(ctx).notify(91, n)
+        } catch (_: SecurityException) {}
+    }
 
     @Suppress("DEPRECATION")
     private fun sameSignature(apk: File): Boolean {
@@ -137,10 +154,19 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
 
     /** L'utilisateur accepte de récupérer la version du voisin. */
     fun requestFromPeer(peerId: String) {
+        if (!core.hasWifiLink(peerId)) { message.value = "Ce voisin n'est pas joignable en Wi-Fi direct : la mise à jour ne peut pas passer en Bluetooth (trop lent)."; return }
         val j = JSONObject().put("c", "req").put("v", myCode).toString()
         core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), j.toByteArray()))
         progress.value = 0
+        lastPartAt = System.currentTimeMillis()
+        scope.launch {
+            while (progress.value >= 0) {
+                kotlinx.coroutines.delay(5000)
+                if (progress.value >= 0 && System.currentTimeMillis() - lastPartAt > 60_000) { progress.value = -1; message.value = "La mise à jour n'arrive pas : le voisin n'est plus joignable en Wi-Fi direct."; break }
+            }
+        }
     }
+    @Volatile private var lastPartAt = 0L
 
     /** Rend true si la trame était pour la mise à jour. */
     fun handle(f: Frame, fromPeer: String): Boolean {
@@ -154,8 +180,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
             when (j.optString("c")) {
                 "offer" -> {
                     val v = j.optInt("v")
-                    if (v > myCode && v != settings.lastOfferedVersion) {
-                        settings.lastOfferedVersion = v
+                    val refusedRecently = v == settings.lastOfferedVersion && System.currentTimeMillis() - settings.lastOfferedAt < 24 * 3600_000L
+                    if (v > myCode && !refusedRecently && available.value == null && progress.value < 0) {
                         available.value = UpdateInfo(v, j.optString("n"), f.fromHex, core.peer(f.fromHex)?.name)
                     }
                 }
@@ -167,7 +193,7 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     }
 
     private fun sendApk(peerId: String) = scope.launch {
-        if (core.peer(peerId)?.wifi != true) { Log.i(tag, "APK : pas de Wi-Fi avec $peerId"); return@launch }
+        if (!core.hasWifiLink(peerId)) { Log.i(tag, "APK : pas de prise Wi-Fi avec $peerId"); return@launch }
         try {
             val src = File(ctx.applicationInfo.sourceDir)
             val data = src.readBytes()
@@ -189,6 +215,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     private fun onPart(j: JSONObject, data: ByteArray, from: String) {
         val code = j.optInt("v"); val idx = j.optInt("i"); val total = j.optInt("n"); val size = j.optInt("s")
         if (code <= myCode) return
+        if (total <= 0 || idx < 0 || idx >= total || size <= 0 || size > 200_000_000 || idx.toLong() * PART + data.size > size) return
+        lastPartAt = System.currentTimeMillis()
         if (receiving == null || receivingCode != code) {
             receivingFile?.delete()
             val f = File(ctx.cacheDir, "Proximo-voisin.apk")
@@ -205,7 +233,10 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
         }
     }
 
-    fun dismiss() { available.value = null; message.value = null }
+    fun dismiss() {
+        available.value?.let { settings.lastOfferedVersion = it.code; settings.lastOfferedAt = System.currentTimeMillis() }
+        available.value = null; message.value = null
+    }
 
     companion object {
         const val REPO = "ismailersevik4/proximo"

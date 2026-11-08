@@ -50,8 +50,11 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private val wantContact = ConcurrentHashMap.newKeySet<String>()
     /** Discussion ouverte à l'écran (pas de notification pour elle). */
     @Volatile var openChat: String? = null
-    /** Dernier événement à afficher en bandeau (ex. demande de contact). */
-    val events = MutableStateFlow<String?>(null)
+    /** Dernier événement à afficher en bandeau (ex. demande de contact). Le numéro évite qu'un même texte répété soit ignoré. */
+    data class Event(val n: Long, val text: String)
+    val events = MutableStateFlow<Event?>(null)
+    private var eventCounter = 0L
+    fun event(text: String) { events.value = Event(++eventCounter, text) }
 
     // =============== côté utilisateur ===============
 
@@ -82,7 +85,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
             }
             else -> {
                 val c = db.contact(chat) ?: cards[chat]?.let { Contact(it.id, it.name, it.dhPub, it.sigPub, 0, 0, 0) }
-                if (c == null) { events.value = "Impossible d'écrire : contact inconnu"; return }
+                if (c == null) { event("Impossible d'écrire : contact inconnu"); return }
                 val to = Hex.dec(c.id)
                 Frame(Frame.DM, Frame.DEFAULT_TTL, 0, 0, fid, core.myIdBytes(), to, Crypto.sealFor(c.dhPub, inner, fid + core.myIdBytes() + to))
             }
@@ -130,30 +133,30 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     /** Ajouter un voisin vu sur le radar. */
     fun requestContact(peerId: String) {
         val card = cards[peerId]
-        if (card == null) { wantContact.add(peerId); askCard(peerId); events.value = "Demande en cours…"; return }
+        if (card == null) { wantContact.add(peerId); askCard(peerId); event("Demande en cours…"); return }
         addFromCard(card)
     }
 
     /** Ajouter depuis une carte (QR code ou carte reçue). */
     fun addFromCard(card: Card) {
-        if (card.id == me.id) { events.value = "C'est ton propre code"; return }
+        if (card.id == me.id) { event("C'est ton propre code"); return }
         val existing = db.contact(card.id)
-        if (existing?.accepted == true) { events.value = "${card.name} est déjà dans tes contacts"; return }
+        if (existing?.accepted == true) { event("${card.name} est déjà dans tes contacts"); return }
         if (existing?.status == 2) { acceptContact(card.id); return }
         db.saveContact(card, 0)
         core.send(Frame(Frame.CONTACT_REQ, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(card.id), me.card().toJson().toString().toByteArray()))
-        events.value = "Demande envoyée à ${card.name}"
+        event("Demande envoyée à ${card.name}")
     }
 
     /** Ajouter avec un code PRX-XXXX-XXXX : se fera dès que le téléphone est à portée. */
     fun addByCode(code: String): Boolean {
         val n = Identity.normalizeCode(code)
         if (n.isEmpty()) return false
-        if (n == me.shortCode) { events.value = "C'est ton propre code"; return true }
+        if (n == me.shortCode) { event("C'est ton propre code"); return true }
         cards.values.firstOrNull { it.shortCode == n }?.let { addFromCard(it); return true }
         db.addPendingCode(n)
         core.peers.value.forEach { askCard(it.id) }
-        events.value = "Code enregistré : l'ajout se fera dès que ce téléphone sera à portée"
+        event("Code enregistré : l'ajout se fera dès que ce téléphone sera à portée")
         return true
     }
 
@@ -199,17 +202,19 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
 
     // =============== côté réseau ===============
 
-    fun handle(f: Frame, fromPeer: String) {
+    /** Rend false si la trame n'a pas pu être traitée faute de clé (elle pourra être rejouée). */
+    fun handle(f: Frame, fromPeer: String): Boolean {
         when (f.type) {
             Frame.CARD_REQ -> core.send(Frame(Frame.CARD, 0, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray()))
             Frame.CARD -> onCard(f)
             Frame.CONTACT_REQ -> onContactReq(f)
             Frame.CONTACT_ACCEPT -> onContactAccept(f)
-            Frame.DM -> onDm(f)
-            Frame.GROUP -> onGroup(f)
+            Frame.DM -> return onDm(f)
+            Frame.GROUP -> return onGroup(f)
             Frame.PUBLIC, Frame.SOS -> onPublic(f)
             Frame.ACK -> onAck(f)
         }
+        return true
     }
 
     private fun cardOf(f: Frame): Card? = Card.fromJson(JSONObject(String(f.payload))).takeIf { it?.id == f.fromHex }
@@ -230,7 +235,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         when {
             existing?.accepted == true -> { db.saveContact(card, 1); core.send(Frame(Frame.CONTACT_ACCEPT, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray())) }
             existing?.status == 0 -> { db.saveContact(card, 1); acceptContact(card.id) }   // on s'était ajoutés mutuellement
-            else -> { db.saveContact(card, 2); events.value = "${card.name} veut t'ajouter en contact"; notify("Demande de contact", "${card.name} veut t'ajouter", "contacts", false) }
+            else -> { db.saveContact(card, 2); event("${card.name} veut t'ajouter en contact"); notify("Demande de contact", "${card.name} veut t'ajouter", "contacts", false) }
         }
     }
 
@@ -242,14 +247,19 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         notify("Contact accepté", "${card.name} a accepté ta demande", card.id, false)
     }
 
-    private fun onDm(f: Frame) {
+    private fun onDm(f: Frame): Boolean {
         val from = f.fromHex
-        val plain = Crypto.openWith(me.dhPriv, me.dhPub, f.payload, f.fid + f.from + f.to) ?: return
-        val inn = parseInner(plain) ?: return
+        val plain = Crypto.openWith(me.dhPriv, me.dhPub, f.payload, f.fid + f.from + f.to) ?: return true
+        val inn = parseInner(plain) ?: return true
         val contact = db.contact(from)
         val sigPub = contact?.sigPub ?: cards[from]?.sigPub
-        if (!verifyInner(f.fidHex, inn, sigPub)) { Log.w(tag, "signature invalide de $from"); return }
-        if (contact?.accepted != true && !settings.allowUnknownDm) { Log.i(tag, "message privé d'un inconnu ignoré"); return }
+        if (sigPub == null) { Log.i(tag, "clé de $from pas encore connue : on demande sa carte, le message sera rejoué"); askCard(from); return false }
+        if (!verifyInner(f.fidHex, inn, sigPub)) { Log.w(tag, "signature invalide de $from"); return true }
+        if (contact?.accepted != true && !settings.allowUnknownDm) {
+            // Pas encore accepté : si sa demande est en attente, le message attend qu'on l'accepte.
+            if (contact?.status == 2 || contact?.status == 0) return false
+            Log.i(tag, "message privé d'un inconnu ignoré"); return true
+        }
         val kind = inn.json.optString("k")
         val senderName = contact?.name ?: inn.json.optString("n", "Inconnu")
         // Accusé de réception : repart vers l'émetteur par le réseau.
@@ -258,6 +268,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
             "ginv" -> onGroupInvite(from, inn.json.optString("b"))
             else -> store(f, from, from, senderName, inn, kind)
         }
+        return true
     }
 
     private fun onGroupInvite(from: String, body: String) {
@@ -276,17 +287,19 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         } catch (e: Exception) { Log.w(tag, "invitation groupe", e) }
     }
 
-    private fun onGroup(f: Frame) {
-        if (f.payload.size < 8 + 28) return
+    private fun onGroup(f: Frame): Boolean {
+        if (f.payload.size < 8 + 28) return true
         val gid = Hex.enc(f.payload.copyOfRange(0, 8))
-        val g = db.group(gid) ?: return
-        val plain = Crypto.aesDecrypt(g.key, f.payload.copyOfRange(8, f.payload.size), f.fid) ?: return
-        val inn = parseInner(plain) ?: return
+        // Groupe pas encore connu (l'invitation n'est pas arrivée) : on garde la possibilité de rejouer.
+        val g = db.group(gid) ?: return false
+        val plain = Crypto.aesDecrypt(g.key, f.payload.copyOfRange(8, f.payload.size), f.fid) ?: return true
+        val inn = parseInner(plain) ?: return true
         val from = f.fromHex
         val contact = db.contact(from)
         val sigPub = contact?.sigPub ?: cards[from]?.sigPub
-        if (sigPub != null && !verifyInner(f.fidHex, inn, sigPub)) return
+        if (sigPub != null && !verifyInner(f.fidHex, inn, sigPub)) return true
         store(f, gid, from, contact?.name ?: inn.json.optString("n", "Membre"), inn, inn.json.optString("k"))
+        return true
     }
 
     private fun onPublic(f: Frame) {
@@ -321,7 +334,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val file = inn.blob?.let { saveBlob(mid, kind, it) }
         val isOpen = openChat == chat
         val route = if (f.hops == 0) "direct" else "${f.hops} saut(s)"
-        db.saveMessage(Message(mid, chat, from, false, kind, body, file, inn.json.optLong("t", System.currentTimeMillis()), Message.DELIVERED, isOpen, route))
+        db.saveMessage(Message(mid, chat, from, false, kind, body, file, inn.json.optLong("t", System.currentTimeMillis()), Message.DELIVERED, isOpen, route, senderName))
         db.touchContact(from)
         val preview = when (kind) {
             Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal (${body}s)"; Message.LOC -> "📍 Position"; Message.SOS -> "🆘 SOS"; else -> body
@@ -354,16 +367,25 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
                 .build()
             NotificationManagerCompat.from(ctx).notify(chat.hashCode(), n)
         } catch (e: SecurityException) { Log.w(tag, "notification refusée") }
-        if (sos) try { val tg = ToneGenerator(AudioManager.STREAM_ALARM, 100); tg.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 2500) } catch (_: Exception) {}
+        if (sos) beep(AudioManager.STREAM_ALARM, ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 2500)
+    }
+
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun beep(stream: Int, tone: Int, ms: Int) {
+        try {
+            val tg = ToneGenerator(stream, 90)
+            tg.startTone(tone, ms)
+            mainHandler.postDelayed({ try { tg.release() } catch (_: Exception) {} }, ms + 300L)
+        } catch (_: Exception) {}
     }
 
     private fun playVoice(path: String) {
         try {
-            try { ToneGenerator(AudioManager.STREAM_MUSIC, 80).startTone(ToneGenerator.TONE_PROP_BEEP, 150) } catch (_: Exception) {}
+            beep(AudioManager.STREAM_MUSIC, ToneGenerator.TONE_PROP_BEEP, 150)
             val mp = MediaPlayer()
             mp.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
             mp.setDataSource(path)
-            mp.setOnCompletionListener { it.release(); try { ToneGenerator(AudioManager.STREAM_MUSIC, 80).startTone(ToneGenerator.TONE_PROP_BEEP2, 200) } catch (_: Exception) {} }
+            mp.setOnCompletionListener { it.release(); beep(AudioManager.STREAM_MUSIC, ToneGenerator.TONE_PROP_BEEP2, 200) }
             mp.setOnPreparedListener { it.start() }
             mp.prepareAsync()
         } catch (e: Exception) { Log.w(tag, "lecture vocal", e) }
