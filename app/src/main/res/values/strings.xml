@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Proximo</string>
+    <string name="credits">Proximo — conçu et développé par Ismail Ersevik</string>
+    <string name="notif_channel_service">Réseau Proximo</string>
+    <string name="notif_channel_messages">Messages</string>
+    <string name="notif_channel_sos">Alertes SOS</string>
+    <string name="notif_channel_calls">Appels</string>
+    <string name="notif_running">Proximo est à l\'écoute des téléphones autour de toi</string>
+</resources>
