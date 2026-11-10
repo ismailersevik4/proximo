@@ -114,7 +114,7 @@ private fun ChatRow(c: ChatSummary, online: Boolean?, peers: List<fr.proximo.app
                     m == null -> if (isAll) "Parle à tous les téléphones autour de toi" else "Aucun message"
                     m.status == Message.PENDING && m.mine -> if (peers.isEmpty()) "⏳ En attente · personne à portée" else "⏳ En attente d'envoi"
                     else -> (if (m.mine) "Toi : " else "") + when (m.kind) {
-                        Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal · ${m.body}s"; Message.VIDEO -> "🎬 Vidéo · ${m.body}s"; Message.LOC -> "📍 Position partagée"; Message.SOS -> "🆘 SOS"; else -> m.body
+                        Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal · ${m.body}s"; Message.VIDEO -> "🎬 Vidéo · ${m.body}s"; Message.LOC -> "📍 Position partagée"; Message.SOS -> "🆘 SOS"; Message.WIZZ -> "👋 Wizz"; else -> m.body
                     }
                 }
                 Text(preview, color = if (m?.status == Message.PENDING && m.mine) Px.Warn else if (isAll) Px.AccentSoft else if (c.unread > 0) Color.White else Px.Muted, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))

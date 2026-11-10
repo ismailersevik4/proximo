@@ -4,12 +4,13 @@ Messagerie Android **sans Internet** : les téléphones se parlent directement e
 
 Conçu et développé par **Ismail Ersevik**.
 
-## Ce que fait l'appli (version 1.3.6, APK 14)
+## Ce que fait l'appli (version 1.3.7, APK 15)
 
 - **Radar** : les téléphones Proximo à portée, avec distance approximative, ceux déjà en contact et les inconnus (« ? »).
 - **Contacts** : ajout depuis le radar, par QR code ou par code `PRX-XXXX-XXXX` (l'ajout se fait dès que les deux téléphones sont à portée).
 - **Messages privés chiffrés** de bout en bout (X25519 + AES-GCM, signés Ed25519), statuts « En attente → Relayé par… → Reçu ».
 - **Photos** (compressées), **talkie-walkie** (vocal, lu automatiquement à l'arrivée), **position**, **SOS** prioritaire à tout le monde.
+- **Wizz** dans les discussions privées : le téléphone du contact sonne et vibre, même en silencieux (un wizz toutes les 30 s au plus ; un wizz arrivé plus de 10 min après s'affiche sans sonner).
 - **Groupes** (clé de groupe partagée) et canal **« Tout le monde »** (public, à portée).
 - **Appels vocaux** (bêta) chiffrés de bout en bout, en Wi-Fi direct, en direct ou via un voisin relais (2 sauts).
 - **Vidéos courtes** (15 s, 3,5 Mo max), uniquement par Wi-Fi direct, un relais au maximum.

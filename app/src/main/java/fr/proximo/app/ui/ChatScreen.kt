@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Vibration
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -61,6 +62,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -140,7 +142,18 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         if (svc?.messenger?.canSendVideo(chat) == true) action() else svc?.messenger?.event("Vidéo impossible pour l'instant : il faut une liaison Wi-Fi direct (le Bluetooth est trop lent). Envoie une photo ou un vocal.")
     }
 
-    Column(Modifier.fillMaxSize().background(Px.Bg).imePadding()) {
+    // Wizz (envoyé ou reçu) : la discussion tremble.
+    val shake = remember { androidx.compose.animation.core.Animatable(0f) }
+    LaunchedEffect(svc, chat) {
+        svc?.messenger?.wizz?.collect { w ->
+            if (w != null && w.chat == chat && System.currentTimeMillis() - w.at < 3000) {
+                repeat(12) { i -> shake.animateTo(if (i % 2 == 0) 12f else -12f, androidx.compose.animation.core.tween(45)) }
+                shake.animateTo(0f, androidx.compose.animation.core.tween(45))
+            }
+        }
+    }
+
+    Column(Modifier.fillMaxSize().background(Px.Bg).imePadding().graphicsLayer { translationX = shake.value.dp.toPx() }) {
         // ---- en-tête ----
         Row(Modifier.fillMaxWidth().background(Px.Bar).padding(8.dp, 10.dp, 8.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
             if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Retour", tint = Color.White) } else Spacer(Modifier.width(8.dp))
@@ -218,6 +231,11 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                 colors = OutlinedTextFieldDefaults.colors(focusedContainerColor = Px.Card, unfocusedContainerColor = Px.Card, focusedBorderColor = Px.Accent, unfocusedBorderColor = Px.Card2, cursorColor = Px.Accent, focusedTextColor = Color.White, unfocusedTextColor = Color.White),
             )
             Spacer(Modifier.width(6.dp))
+            if (text.isBlank() && !isAll && group == null) {
+                // Wizz : fait sonner et vibrer le téléphone du contact, même en silencieux
+                RoundButton(Icons.Filled.Vibration, "Wizz : faire sonner et vibrer son téléphone", Px.Card, Px.Warn) { svc?.messenger?.sendWizz(chat) }
+                Spacer(Modifier.width(6.dp))
+            }
             if (text.isBlank()) {
                 // Talkie-walkie : maintenir pour parler
                 Box(
@@ -327,6 +345,10 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                     Text("🆘 SOS : " + o.optString("t", m.body), color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     if (o.has("lat")) Text("Voir la position", color = Px.Accent, fontSize = 14.sp, modifier = Modifier.clickable { openSafely(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("geo:${o.optDouble("lat")},${o.optDouble("lon")}?q=${o.optDouble("lat")},${o.optDouble("lon")}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) })
                 }
+                Message.WIZZ -> {
+                    Text(if (m.mine) "👋 Wizz envoyé" else "👋 Wizz !", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    if (!m.mine && m.received - m.time > fr.proximo.app.msg.Messenger.WIZZ_FRESH_MS) Text("Arrivé en retard : n'a pas sonné", color = Px.Warn, fontSize = 11.sp)
+                }
                 else -> Text(m.body, color = Color.White, fontSize = 15.sp)
             }
             if (m.late) Text("Reçu ${stamp(m.received).lowercase()} · écrit ${stamp(m.time).lowercase()}", color = Px.Warn, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
@@ -354,7 +376,7 @@ private fun MessageDetails(m: Message, contactName: (String) -> String?, onClose
         if (!m.mine && m.received > 0) add("Reçu : " + fullStamp(m.received) + if (m.late) "  (en retard)" else "")
         if (!m.mine) add("De : " + (contactName(m.from) ?: m.senderName.ifEmpty { "Inconnu" }))
         add("Chemin : " + m.route.ifEmpty { if (m.mine) when (m.status) { Message.DELIVERED -> "reçu"; Message.RELAYED -> "relayé"; Message.FAILED -> "échec"; else -> "en attente" } else "direct" })
-        add("Type : " + when (m.kind) { Message.PHOTO -> "photo"; Message.VOICE -> "vocal (${m.body} s)"; Message.VIDEO -> "vidéo (${m.body} s)"; Message.LOC -> "position"; Message.SOS -> "SOS"; else -> "texte" })
+        add("Type : " + when (m.kind) { Message.PHOTO -> "photo"; Message.VOICE -> "vocal (${m.body} s)"; Message.VIDEO -> "vidéo (${m.body} s)"; Message.LOC -> "position"; Message.SOS -> "SOS"; Message.WIZZ -> "wizz"; else -> "texte" })
         m.file?.let { f -> val size = File(f).length(); if (size > 0) add("Taille : " + if (size > 1_000_000) "${size / 1_000_000} Mo" else "${size / 1000} Ko") }
     }
     AlertDialog(

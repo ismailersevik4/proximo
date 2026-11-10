@@ -39,6 +39,14 @@ import java.util.concurrent.ConcurrentHashMap
  * et range dans la base ce qui arrive du réseau.
  */
 class Messenger(private val ctx: Context, private val core: MeshCore) {
+    companion object {
+        /** Un wizz toutes les 30 s au plus vers un même contact. */
+        const val WIZZ_EVERY_MS = 30_000L
+        /** Au-delà de 10 min de retard, un wizz s'affiche sans sonner. */
+        const val WIZZ_FRESH_MS = 10 * 60_000L
+        /** Côté réception : pas deux sonneries du même contact à moins de 20 s. */
+        const val WIZZ_RING_GAP_MS = 20_000L
+    }
     private val tag = "ProximoMsg"
     private val db = Db.get(ctx)
     private val me = Identity.get(ctx)
@@ -72,6 +80,27 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         else -> core.hasWifiLink(chat) || core.wifiLinkedPeers().isNotEmpty()
     }
     fun sendLocation(chat: String, lat: Double, lon: Double) = sendMessage(chat, Message.LOC, "$lat,$lon", null)
+
+    // ---- wizz ----
+    /** Un wizz à afficher à l'écran (la discussion ouverte tremble). */
+    data class Wizz(val n: Long, val chat: String, val at: Long)
+    val wizz = MutableStateFlow<Wizz?>(null)
+    private var wizzCounter = 0L
+    private val wizzSentAt = ConcurrentHashMap<String, Long>()
+    private val wizzRungAt = ConcurrentHashMap<String, Long>()
+    private fun shake(chat: String) { wizz.value = Wizz(++wizzCounter, chat, System.currentTimeMillis()) }
+
+    /** Wizz : uniquement en privé, un toutes les 30 s par contact. Le texte « Wizz ! » reste lisible sur une ancienne version. */
+    fun sendWizz(chat: String) {
+        if (chat == Db.ALL || db.group(chat) != null) { event("Le wizz ne marche qu'en discussion privée"); return }
+        val now = System.currentTimeMillis()
+        val wait = WIZZ_EVERY_MS - (now - (wizzSentAt[chat] ?: 0L))
+        if (wait > 0) { event("Attends encore ${(wait + 999) / 1000} s avant un nouveau wizz"); return }
+        wizzSentAt[chat] = now
+        sendMessage(chat, Message.WIZZ, "Wizz !", null)
+        shake(chat)
+        event("Wizz envoyé")
+    }
 
     /** SOS : à tout le monde, prioritaire, avec ma position si on l'a. */
     fun sendSos(text: String, lat: Double?, lon: Double?) {
@@ -385,12 +414,67 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         db.saveMessage(Message(mid, chat, from, false, kind, body, file, sentAt, Message.DELIVERED, isOpen, route, senderName, now))
         val late = now - sentAt > 3600_000L
         db.touchContact(from)
+        if (kind == Message.WIZZ) { onWizz(chat, from, senderName, now - sentAt, isOpen); return }
         val preview = when (kind) {
             Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal (${body}s)"; Message.VIDEO -> "🎬 Vidéo (${body}s)"; Message.LOC -> "📍 Position"; Message.SOS -> "🆘 SOS"; else -> body
         }
         val title = if (chat == Db.ALL) "$senderName · Tout le monde" else if (db.group(chat) != null) "$senderName · ${db.group(chat)?.name}" else senderName
         if (kind != Message.SOS && !isOpen) notify(if (late) "$title · écrit le ${java.text.SimpleDateFormat("d MMM HH:mm", java.util.Locale.FRANCE).format(java.util.Date(sentAt))}" else title, preview, chat, false)
         if (kind == Message.VOICE && file != null && settings.autoPlayVoice) playVoice(file)
+    }
+
+    /**
+     * Wizz reçu. En privé, d'un contact accepté et arrivé à temps : le téléphone sonne et vibre, même en silencieux.
+     * Arrivé plus de 10 min après (ou hors discussion privée) : simple notification muette, sans sonnerie.
+     */
+    private fun onWizz(chat: String, from: String, senderName: String, ageMs: Long, isOpen: Boolean) {
+        val now = System.currentTimeMillis()
+        val direct = chat == from && db.contact(from)?.accepted == true
+        val fresh = ageMs <= WIZZ_FRESH_MS
+        val ring = direct && fresh && now - (wizzRungAt[from] ?: 0L) >= WIZZ_RING_GAP_MS
+        if (ring) { wizzRungAt[from] = now; ringWizz(); shake(chat) }
+        if (!isOpen) notify(senderName, if (fresh) "👋 Wizz !" else "👋 Wizz (arrivé en retard)", chat, false, silent = true)
+    }
+
+    /** Sonnerie + vibration du wizz sur le canal « alarme » : passe même si le téléphone est en silencieux. */
+    @Volatile private var wizzRinging = false
+    @Suppress("DEPRECATION")
+    private fun ringWizz() {
+        try {
+            val pattern = longArrayOf(0, 110, 60, 110, 60, 110, 60, 380, 160, 110, 60, 110, 60, 110, 60, 380, 160, 110, 60, 110, 60, 500)
+            val effect = android.os.VibrationEffect.createWaveform(pattern, -1)
+            val vib = ctx.getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator
+            if (android.os.Build.VERSION.SDK_INT >= 33) vib?.vibrate(effect, android.os.VibrationAttributes.createForUsage(android.os.VibrationAttributes.USAGE_ALARM))
+            else vib?.vibrate(effect, AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+        } catch (e: Exception) { Log.w(tag, "vibration wizz", e) }
+        // Pendant un appel, on ne couvre pas la voix : vibration seulement.
+        val inCall = try { fr.proximo.app.mesh.MeshService.instance?.calls?.state?.value?.phase == fr.proximo.app.call.CallState.ACTIVE } catch (_: Exception) { false }
+        if (inCall) return
+        if (wizzRinging) return
+        wizzRinging = true
+        var restore: Int? = null
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        try {
+            // Volume d'alarme trop bas ou à zéro : on le remonte le temps du wizz, puis on le remet comme avant.
+            if (am != null) {
+                val max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+                val cur = am.getStreamVolume(AudioManager.STREAM_ALARM)
+                val want = (max * 7 + 9) / 10
+                if (cur < want) { am.setStreamVolume(AudioManager.STREAM_ALARM, want, 0); restore = cur }
+            }
+        } catch (e: Exception) { Log.w(tag, "volume wizz", e) }
+        var tg: ToneGenerator? = null
+        try { tg = ToneGenerator(AudioManager.STREAM_ALARM, 100) } catch (e: Exception) { Log.w(tag, "son wizz", e) }
+        // Deux rafales de quatre notes rapides, calées sur la vibration.
+        val notes = intArrayOf(ToneGenerator.TONE_DTMF_A, ToneGenerator.TONE_DTMF_D, ToneGenerator.TONE_DTMF_A, ToneGenerator.TONE_DTMF_D)
+        val starts = longArrayOf(0, 170, 340, 510, 1050, 1220, 1390, 1560)
+        val gen = tg
+        if (gen != null) starts.forEachIndexed { i, t -> mainHandler.postDelayed({ try { gen.startTone(notes[i % notes.size], if (i % 4 == 3) 380 else 120) } catch (_: Exception) {} }, t) }
+        mainHandler.postDelayed({
+            try { gen?.release() } catch (_: Exception) {}
+            try { restore?.let { am?.setStreamVolume(AudioManager.STREAM_ALARM, it, 0) } } catch (_: Exception) {}
+            wizzRinging = false
+        }, 2400)
     }
 
     /** Appelé par le cœur quand une de mes trames est passée à un voisin : statut « Relayé par … ». */
@@ -404,7 +488,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     }
 
     // ---- notifications et sons ----
-    private fun notify(title: String, text: String, chat: String, sos: Boolean) {
+    private fun notify(title: String, text: String, chat: String, sos: Boolean, silent: Boolean = false) {
         try {
             val i = Intent(ctx, MainActivity::class.java).putExtra("chat", chat).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
             val pi = PendingIntent.getActivity(ctx, chat.hashCode(), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -412,7 +496,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
                 .setSmallIcon(R.drawable.ic_notif).setContentTitle(title).setContentText(text).setAutoCancel(true).setContentIntent(pi)
                 .setPriority(if (sos) NotificationCompat.PRIORITY_MAX else NotificationCompat.PRIORITY_HIGH)
                 .setCategory(if (sos) NotificationCompat.CATEGORY_ALARM else NotificationCompat.CATEGORY_MESSAGE)
-                .setSilent(!settings.sounds && !sos)
+                .setSilent(silent || (!settings.sounds && !sos))
                 .build()
             NotificationManagerCompat.from(ctx).notify(chat.hashCode(), n)
         } catch (e: SecurityException) { Log.w(tag, "notification refusée") }
