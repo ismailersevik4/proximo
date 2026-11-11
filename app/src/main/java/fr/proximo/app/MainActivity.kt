@@ -32,7 +32,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        pendingChat = intent?.getStringExtra("chat")
+        // La discussion d'une notification n'est ouverte qu'une fois : pas à chaque rotation, ni au retour depuis les applis récentes.
+        val fromHistory = ((intent?.flags ?: 0) and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
+        pendingChat = if (savedInstanceState == null && !fromHistory) intent?.getStringExtra("chat") else null
         permissionsOk = requiredPermissions().all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
         setContent { ProximoTheme { AppRoot(this) } }
     }

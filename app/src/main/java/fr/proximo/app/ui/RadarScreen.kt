@@ -90,8 +90,11 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
             Chip(if (wifi?.enabled == true) "Wi-Fi direct ✓" else "Wi-Fi direct ✗", wifi?.enabled == true)
             key(settingsTick) { Chip("Mode : " + when (settings.mode) { Modes.PORTEE -> "portée"; Modes.BATTERIE -> "batterie"; else -> "normal" }, null) }
         }
-        val problem = status.values.firstOrNull { !it.enabled }?.detail
-        if (problem != null) Text(problem, color = Px.Warn, fontSize = 12.sp, modifier = Modifier.padding(20.dp, 8.dp, 20.dp, 0.dp))
+        // Tous les avertissements des transports, y compris ceux d'un Bluetooth « actif » qui ne marche qu'à moitié
+        // (téléphone qui ne peut pas s'annoncer, recherche en erreur, localisation coupée…).
+        status.values.filter { !it.enabled || !it.detail.endsWith("actif") }.map { it.detail }.distinct().forEach {
+            Text(it, color = Px.Warn, fontSize = 12.sp, modifier = Modifier.padding(20.dp, 8.dp, 20.dp, 0.dp))
+        }
 
         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
             Radar(peers, contacts, onTap = { selected = it })
@@ -106,7 +109,9 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
     selected?.let { p ->
         val c = contacts.firstOrNull { it.id == p.id }
         val name = c?.name ?: p.name ?: "Téléphone inconnu"
-        val canCall = svc?.calls?.canCall(p.id) == true
+        val canCall by androidx.compose.runtime.produceState(false, svc, p.id) {
+            while (true) { value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { svc?.calls?.canCall(p.id) == true }; kotlinx.coroutines.delay(3000) }
+        }
         AlertDialog(
             onDismissRequest = { selected = null },
             containerColor = Px.Card,
@@ -159,15 +164,18 @@ private fun Radar(peers: List<Peer>, contacts: List<Contact>, onTap: (Peer) -> U
     val tapRadius = with(density) { 30.dp.toPx() }
     val ctx = LocalContext.current
     val tick by fr.proximo.app.core.Db.get(ctx).changes.collectAsState()
-    val photos = remember(peers, tick) {
+    // Les photos ne sont redécodées que si la liste des voisins change (pas à chaque variation du signal).
+    val ids = peers.map { it.id }
+    val currentPeers by androidx.compose.runtime.rememberUpdatedState(peers)
+    val photos = remember(ids, tick) {
         peers.mapNotNull { p -> fr.proximo.app.core.Avatars.fileIfExists(ctx, p.id)?.let { f -> android.graphics.BitmapFactory.decodeFile(f.absolutePath)?.let { b -> p.id to b.asImageBitmap() } } }.toMap()
     }
 
     Canvas(
-        Modifier.fillMaxWidth(0.94f).aspectRatio(1f).pointerInput(peers) {
+        Modifier.fillMaxWidth(0.94f).aspectRatio(1f).pointerInput(Unit) {
             detectTapGestures { pos ->
                 val hit = positions.entries.minByOrNull { hypot(it.value.x - pos.x, it.value.y - pos.y) }
-                if (hit != null && hypot(hit.value.x - pos.x, hit.value.y - pos.y) <= tapRadius) peers.firstOrNull { it.id == hit.key }?.let(onTap)
+                if (hit != null && hypot(hit.value.x - pos.x, hit.value.y - pos.y) <= tapRadius) currentPeers.firstOrNull { it.id == hit.key }?.let(onTap)
             }
         },
     ) {

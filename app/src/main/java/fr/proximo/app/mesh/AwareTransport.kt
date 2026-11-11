@@ -75,9 +75,22 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         var cb: ConnectivityManager.NetworkCallback? = null
         var connecting = false
         val assembler = Fragmenter.Assembler()
-        var msgId = 1
+        @Volatile var dialing = false
     }
     private val peers = ConcurrentHashMap<String, Peer>()
+    /** Numéros des petits messages, communs à tous les voisins : on sait ainsi lequel a échoué. */
+    private val msgIds = java.util.concurrent.atomic.AtomicInteger(1)
+    private fun nextMsgId(): Int = msgIds.getAndUpdate { if (it >= 1_000_000_000) 1 else it + 1 }
+    /** Petits messages partis et pas encore confirmés : numéro -> (voisin, identifiant de la trame). */
+    private val sentMsgs = ConcurrentHashMap<Int, Pair<String, String>>()
+    private fun track(p: Peer, data: ByteArray): Int {
+        val id = nextMsgId()
+        if (data.size >= Frame.HEADER) {
+            if (sentMsgs.size > 500) sentMsgs.clear()
+            sentMsgs[id] = p.id to Hex.enc(data.copyOfRange(7, 23))
+        }
+        return id
+    }
 
     val available: Boolean get() = mgr != null
 
@@ -90,7 +103,12 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         try {
             startServer()
             m.attach(object : AttachCallback() {
-                override fun onAttached(s: WifiAwareSession) { session = s; publish(); subscribe(); listener.onStatus(name, true, "Wi-Fi direct actif") }
+                override fun onAttached(s: WifiAwareSession) {
+                    session = s
+                    // Autorisation refusée (Android 12) : pas de plantage, juste un Wi-Fi direct indisponible.
+                    try { publish(); subscribe(); listener.onStatus(name, true, "Wi-Fi direct actif") }
+                    catch (e: Exception) { Log.w(tag, "publication", e); listener.onStatus(name, false, "Wi-Fi direct : autorisation manquante") }
+                }
                 override fun onAttachFailed() { listener.onStatus(name, false, "Wi-Fi direct : connexion refusée") }
             }, handler)
             handler.postDelayed(housekeeping, 20_000)
@@ -100,8 +118,11 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     override fun stop() {
         running = false
         handler.removeCallbacks(housekeeping)
+        val ids = peers.keys.toList()
         peers.values.forEach { closePeer(it) }
-        peers.clear()
+        peers.clear(); sentMsgs.clear()
+        // Le radar ne garde pas l'indication « Wi-Fi direct » après l'arrêt.
+        ids.forEach { listener.onPeerLost(it, name) }
         try { pub?.close(); sub?.close(); session?.close() } catch (_: Exception) {}
         pub = null; sub = null; session = null
         try { server?.close() } catch (_: Exception) {}
@@ -113,6 +134,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
 
     override fun hasFastLink(peerId: String): Boolean = peers[peerId]?.out != null
 
+    override fun backlog(peerId: String): Int { val p = peers[peerId] ?: return 0; return if (p.out == null) 0 else p.queue.sumOf { it.size } }
+
     override fun connectedPeers(): Set<String> = peers.values.filter { it.out != null || it.pubHandle != null || it.subHandle != null }.map { it.id }.toSet()
 
     /** Envoi : par la prise si elle est ouverte, sinon par petits messages (si la trame est courte). */
@@ -120,10 +143,12 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         val p = peers[peerId] ?: return false
         if (p.out != null) { p.queue.offer(data); return true }
         if (data.size <= 250) {
-            val h = p.pubHandle; val s = sub
-            if (h != null && s != null) { s.sendMessage(h, p.msgId++, data); return true }
-            val h2 = p.subHandle; val pb = pub
-            if (h2 != null && pb != null) { pb.sendMessage(h2, p.msgId++, data); return true }
+            try {
+                val h = p.pubHandle; val s = sub
+                if (h != null && s != null) { s.sendMessage(h, track(p, data), data); return true }
+                val h2 = p.subHandle; val pb = pub
+                if (h2 != null && pb != null) { pb.sendMessage(h2, track(p, data), data); return true }
+            } catch (e: Exception) { Log.w(tag, "petit message", e) }
             return false
         }
         // Trame longue sans prise : on demande la voie de données (le plus petit identifiant initie).
@@ -137,7 +162,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         session?.publish(cfg, object : DiscoverySessionCallback() {
             override fun onPublishStarted(s: PublishDiscoverySession) { pub = s }
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { onMsg(peerHandle, message, fromPublish = true) }
-            override fun onMessageSendFailed(messageId: Int) { onSendFailed() }
+            override fun onMessageSendFailed(messageId: Int) { onSendFailed(messageId) }
+            override fun onMessageSendSucceeded(messageId: Int) { sentMsgs.remove(messageId) }
             override fun onSessionTerminated() { pub = null; if (running) handler.postDelayed({ publish() }, 3000) }
         }, handler)
     }
@@ -155,11 +181,12 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                 p.pubHandle = peerHandle; p.lastSeen = System.currentTimeMillis(); if (nm != null) p.name = nm
                 listener.onPeerSeen(id, nm, name, 0)
                 // Je me signale à lui (il ne me voit peut-être pas encore) et je demande la voie de données si je suis le plus petit.
-                sub?.sendMessage(peerHandle, p.msgId++, hello())
+                try { sub?.sendMessage(peerHandle, nextMsgId(), hello()) } catch (e: Exception) { Log.w(tag, "hello", e) }
                 if (myId < id) requestDataPath(p)
             }
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { onMsg(peerHandle, message, fromPublish = false) }
-            override fun onMessageSendFailed(messageId: Int) { onSendFailed() }
+            override fun onMessageSendFailed(messageId: Int) { onSendFailed(messageId) }
+            override fun onMessageSendSucceeded(messageId: Int) { sentMsgs.remove(messageId) }
             override fun onSessionTerminated() { sub = null; if (running) handler.postDelayed({ subscribe() }, 3000) }
         }, handler)
     }
@@ -169,8 +196,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         while (n.toByteArray().size > 24 && n.isNotEmpty()) n = n.dropLast(1)
         return Hex.dec(myId) + n.toByteArray()
     }
-    /** On ne sait pas quel pair a échoué : on redonne leur chance à tous les pairs sans prise. */
-    private fun onSendFailed() { for (p in peers.values) if (p.out == null) MeshService.instance?.core?.onDeliveryFailed(p.id) }
+    /** Un petit message n'est pas passé : seule cette trame est remise en attente pour ce voisin (plus toute la file de tous les voisins). */
+    private fun onSendFailed(messageId: Int) { sentMsgs.remove(messageId)?.let { (peer, fid) -> MeshService.instance?.core?.onFrameFailed(peer, fid) } }
 
     private fun hello(): ByteArray = Frame(Frame.HELLO, 0, 0, 0, Frame.newId(), Hex.dec(myId), Frame.BROADCAST, myName().toByteArray()).encode()
 
@@ -240,7 +267,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             if (!running || peers[p.id] !== p || p.out != null) return@postDelayed
             if (myId < p.id) {
                 // Je me re-signale (l'éditeur réarme sa voie de données à la réception du HELLO), puis je redemande.
-                p.pubHandle?.let { h -> sub?.sendMessage(h, p.msgId++, hello()) }
+                try { p.pubHandle?.let { h -> sub?.sendMessage(h, nextMsgId(), hello()) } } catch (e: Exception) { Log.w(tag, "hello", e) }
                 handler.postDelayed({ if (running && peers[p.id] === p && p.out == null) requestDataPath(p) }, 1500)
             } else acceptDataPath(p)
         }, wait + 100)
@@ -256,13 +283,16 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                 val info = caps.transportInfo as? WifiAwareNetworkInfo ?: return
                 val addr = info.peerIpv6Addr ?: return
                 val port = info.port
-                if (p.socket != null) return
+                // Android rappelle parfois cette fonction plusieurs fois de suite : une seule prise à la fois.
+                if (p.socket != null || p.dialing) return
+                p.dialing = true
                 exec.execute {
                     try {
                         val sock = network.socketFactory.createSocket()
                         sock.connect(InetSocketAddress(addr, port), 8000)
+                        p.dialing = false
                         serve(sock, p)
-                    } catch (e: Exception) { Log.w(tag, "connexion prise", e); if (p.cb === this) releaseRequest(p); scheduleRetry(p) }
+                    } catch (e: Exception) { p.dialing = false; Log.w(tag, "connexion prise", e); if (p.cb === this) releaseRequest(p); scheduleRetry(p) }
                 }
             }
             override fun onLost(network: Network) { closeSocket(p); if (p.cb === this) releaseRequest(p); scheduleRetry(p) }
@@ -282,7 +312,10 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             val out = DataOutputStream(sock.getOutputStream())
             val inp = DataInputStream(sock.getInputStream())
             writeFrame(out, hello())
+            // Une prise qui ne se présente pas dans les 10 s est fermée (elle ne doit pas rester ouverte indéfiniment).
+            sock.soTimeout = 10_000
             val first = readFrame(inp) ?: return
+            sock.soTimeout = 0
             val f = Frame.decode(first) ?: return
             if (f.type != Frame.HELLO) return
             val id = f.fromHex
@@ -331,6 +364,8 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         val had = p.socket != null
         try { p.socket?.close() } catch (_: Exception) {}
         p.socket = null; p.out = null
+        // Ce qui attendait dans cette prise sera renvoyé par le cœur : on ne le garde pas en double pour la prochaine.
+        p.queue.clear()
         if (had) { MeshService.instance?.core?.onDeliveryFailed(p.id); listener.onPeerSeen(p.id, p.name, name, 0) }
     }
     private fun closePeer(p: Peer) {
@@ -346,7 +381,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                 if (p.out != null) { p.lastSeen = now; listener.onPeerSeen(p.id, p.name, name, 0); continue }
                 if (now - p.lastSeen > 180_000) { closePeer(p); peers.remove(p.id); listener.onPeerLost(p.id, name); continue }
                 // Sans prise, on se signale pour rester visibles l'un pour l'autre (le HELLO reçu rafraîchit lastSeen chez l'autre).
-                try { p.pubHandle?.let { h -> sub?.sendMessage(h, p.msgId++, hello()) } ?: p.subHandle?.let { h -> pub?.sendMessage(h, p.msgId++, hello()) } } catch (_: Exception) {}
+                try { p.pubHandle?.let { h -> sub?.sendMessage(h, nextMsgId(), hello()) } ?: p.subHandle?.let { h -> pub?.sendMessage(h, nextMsgId(), hello()) } } catch (_: Exception) {}
             }
             // Le pseudo a changé : on republie.
             val i = info()

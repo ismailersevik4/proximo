@@ -43,7 +43,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     private val db = Db.get(ctx)
     private val me = Identity.get(ctx)
     private val myIdBytes = Hex.dec(me.id)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** Filet de sécurité : une erreur dans une tâche de fond (stockage plein…) est notée, elle ne fait plus planter l'appli. */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + kotlinx.coroutines.CoroutineExceptionHandler { _, e -> Log.e(tag, "tâche de fond", e) })
     /** Réception sérialisée : une trame à la fois, dans l'ordre d'arrivée (pas de doublons ni de désordre). */
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private val rx = Dispatchers.IO.limitedParallelism(1)
@@ -51,6 +52,13 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     private val recentSeen = ConcurrentHashMap<String, Long>()
     /** Heure du dernier envoi direct au destinataire d'un de mes messages (pour renvoyer si pas d'accusé). */
     private val lastDirectSend = ConcurrentHashMap<String, Long>()
+    /** Trames confiées récemment à un transport pour un voisin (peut-être pas encore arrivées) : voisin -> (trame -> heure de remise). */
+    private val inFlight = ConcurrentHashMap<String, ConcurrentHashMap<String, Long>>()
+    /** Dernier renvoi d'un accusé pour un message déjà reçu (pas plus d'un par minute et par message). */
+    private val lastReAck = ConcurrentHashMap<String, Long>()
+    private val flushQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    /** Trames « Wi-Fi direct seulement » (vidéos) déjà repérées : on ne relit pas leur fichier pour un voisin en Bluetooth. */
+    private val wifiOnly: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     private val peerMap = ConcurrentHashMap<String, Peer>()
     val peers = MutableStateFlow<List<Peer>>(emptyList())
@@ -69,9 +77,17 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     fun start() {
         transports.forEach { it.start() }
         scope.launch {
-            while (true) { delay(30_000); flush(); expirePeers(); db.purgeOld(); pendingCount.value = db.outboxCount() }
+            var n = 0
+            while (true) {
+                delay(30_000)
+                try {
+                    flush(); expirePeers()
+                    if (n++ % 10 == 0) db.purgeOld() // ménage toutes les 5 minutes (il relit des dossiers entiers)
+                    pendingCount.value = db.outboxCount(); pendingDetail.value = db.outboxDetail()
+                } catch (e: Exception) { Log.e(tag, "entretien", e) }
+            }
         }
-        scope.launch { pendingCount.value = db.outboxCount() }
+        scope.launch { pendingCount.value = db.outboxCount(); pendingDetail.value = db.outboxDetail() }
     }
     fun stop() { scope.cancel(); transports.forEach { it.stop() } }
     fun setMode(mode: Int) { transports.forEach { it.setMode(mode) } }
@@ -91,7 +107,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val linked = connectedPeerIds().contains(peerId)
         val p = Peer(
             id = peerId,
-            name = name ?: old?.name ?: db.contact(peerId)?.name,
+            // Le nom du contact n'est cherché dans la base qu'à la première apparition (pas à chaque annonce Bluetooth).
+            name = name ?: old?.name ?: if (old == null) db.contact(peerId)?.name else null,
             lastSeen = System.currentTimeMillis(),
             ble = (transport == Modes.BLE) || (old?.ble == true),
             wifi = (transport == Modes.WIFI) || (old?.wifi == true),
@@ -122,10 +139,12 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     /** Rejoue les trames mises de côté (clé reçue, contact accepté, groupe rejoint). from = null : toutes. */
     fun replayHeld(from: String?) {
         scope.launch(rx) {
-            for ((fid, data, peer) in db.held(from)) {
+            // Une trame à la fois (pas tout le dossier en mémoire), en gardant sa date d'origine si elle doit encore attendre.
+            for ((fid, peer, t) in db.heldIds(from)) {
+                val data = db.heldData(fid)
                 db.removeHeld(fid)
-                val f = Frame.decode(data) ?: continue
-                try { receive(f, peer, replay = true) } catch (e: Exception) { Log.e(tag, "rejeu", e) }
+                val f = data?.let { Frame.decode(it) } ?: continue
+                try { receive(f, peer, replay = true, heldSince = t) } catch (e: Exception) { Log.e(tag, "rejeu", e) }
             }
         }
     }
@@ -135,19 +154,50 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val p = (peerMap[peerId] ?: Peer(peerId, db.contact(peerId)?.name, System.currentTimeMillis(), false, false, 0, true)).copy(linked = true, lastSeen = System.currentTimeMillis())
         peerMap[peerId] = p
         publishPeers()
-        scope.launch { delay(300); onLinkUp?.invoke(p); flush() }
+        scope.launch {
+            // Liaison (r)ouverte : ce qui avait été confié à l'ancienne dans la dernière minute est redonné, par sécurité.
+            lock.withLock { try { rearm(peerId) } catch (e: Exception) { Log.e(tag, "réarmement", e) } }
+            delay(300); try { onLinkUp?.invoke(p) } catch (e: Exception) { Log.e(tag, "liaison ouverte", e) }; flush()
+        }
     }
 
-    /** Une liaison est tombée alors que des trames étaient en cours d'envoi : elles seront renvoyées à ce voisin. */
+    /**
+     * Une liaison est tombée alors que des trames étaient en cours d'envoi : celles-là (et seulement celles-là)
+     * seront renvoyées à ce voisin. Avant, toute la file d'attente lui était renvoyée à chaque coupure.
+     */
     fun onDeliveryFailed(peerId: String) {
+        scope.launch { lock.withLock { try { rearm(peerId) } catch (e: Exception) { Log.e(tag, "échec de remise", e) } } }
+    }
+
+    /** À appeler sous le verrou : remet en attente pour ce voisin ce qui lui a été confié dans la dernière minute. */
+    private fun rearm(peerId: String) {
+        val fids = inFlight.remove(peerId)?.keys?.toList() ?: return
+        for (fid in fids) db.outboxRow(fid)?.let { o -> if (o.sentTo.remove(peerId)) db.outboxSentTo(fid, o.sentTo) }
+    }
+
+    /** Une seule trame n'est pas passée vers ce voisin (petit message Wi-Fi direct refusé) : elle sera retentée. */
+    fun onFrameFailed(peerId: String, fid: String) {
+        inFlight[peerId]?.remove(fid)
         scope.launch {
             lock.withLock {
-                try { for (o in db.outbox()) if (o.sentTo.remove(peerId)) db.outboxSentTo(o.fid, o.sentTo) } catch (e: Exception) { Log.e(tag, "échec de remise", e) }
+                try { db.outboxRow(fid)?.let { o -> if (o.sentTo.remove(peerId)) db.outboxSentTo(fid, o.sentTo) } } catch (e: Exception) { Log.e(tag, "échec de remise", e) }
             }
         }
     }
 
-    private fun publishPeers() { peers.value = peerMap.values.sortedBy { it.name ?: it.id } }
+    /** Publie la liste des voisins seulement si quelque chose de visible a changé (pas à chaque annonce Bluetooth). */
+    private fun publishPeers() {
+        val l = peerMap.values.sortedBy { it.name ?: it.id }
+        val old = peers.value
+        if (l.size != old.size || l.indices.any { l[it].copy(lastSeen = 0) != old[it].copy(lastSeen = 0) }) peers.value = l
+    }
+
+    /** Demande un passage de la file d'attente ; les demandes en rafale n'en font qu'un. */
+    private fun requestFlush() {
+        if (flushQueued.compareAndSet(false, true)) scope.launch { flushQueued.set(false); flush() }
+    }
+
+    private fun backlog(peerId: String): Int = transports.sumOf { it.backlog(peerId) }
 
     private fun expirePeers() {
         val now = System.currentTimeMillis()
@@ -160,19 +210,24 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     }
 
     // ---------------- réception ----------------
-    private suspend fun receive(f: Frame, fromPeer: String, replay: Boolean = false) {
+    private suspend fun receive(f: Frame, fromPeer: String, replay: Boolean = false, heldSince: Long = 0L) {
         val fid = f.fidHex
         if (f.fromHex == me.id) return
+        // Une trame directe (carte, photo de profil, mise à jour…) ne peut venir que du voisin qui la remet :
+        // personne ne peut l'envoyer au nom d'un autre. Seul l'appel passe par un relais.
+        if (!f.relayable && f.type != Frame.CALL && f.fromHex != fromPeer) return
         val now = System.currentTimeMillis()
         if (f.relayable && !replay) {
             if (recentSeen.containsKey(fid) || db.seen(fid)) {
-                // Déjà reçu : si c'est un message privé pour moi, l'expéditeur n'a peut-être pas eu mon accusé -> je le renvoie.
-                if (f.type == Frame.DM && f.toHex == me.id && db.message(fid) != null) {
+                // Déjà reçu : si c'est un message privé pour moi dont j'ai déjà accusé réception, l'expéditeur n'a peut-être
+                // pas eu mon accusé -> je le renvoie (une fois par minute au plus, même s'il m'arrive par dix voisins).
+                if (f.type == Frame.DM && f.toHex == me.id && now - (lastReAck[fid] ?: 0L) > 60_000 && (db.acked(fid) || db.message(fid) != null)) {
+                    lastReAck[fid] = now
                     send(Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), myIdBytes, f.from, f.fid + byteArrayOf(f.hops.toByte())))
                 }
                 return
             }
-            if (recentSeen.size > 5000) recentSeen.entries.removeAll { now - it.value > 600_000 }
+            if (recentSeen.size > 5000) { recentSeen.entries.removeAll { now - it.value > 600_000 }; lastReAck.entries.removeAll { now - it.value > 600_000 } }
         }
         val forMe = f.isBroadcast || f.toHex == me.id
         // Appel via moi : je passe la trame au destinataire si j'ai une prise Wi-Fi avec lui (un seul relais).
@@ -187,17 +242,22 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         // Dédoublonnage : une trame pour moi que je n'ai pas pu traiter (clé pas encore reçue) est mise de côté et rejouée plus tard.
         if (f.relayable) {
             recentSeen[fid] = now; db.markSeen(fid)
-            if (forMe && !handled) db.saveHeld(fid, f.encode(), f.fromHex, fromPeer)
+            if (forMe && !handled) db.saveHeld(fid, f.encode(), f.fromHex, fromPeer, if (heldSince > 0) heldSince else now)
         }
         if (replay) return
-        // Un accusé de réception vide les files d'attente de tous les relais.
-        if (f.type == Frame.ACK && f.payload.size >= 16) db.removeOutbox(Hex.enc(f.payload.copyOfRange(0, 16)))
+        // Un accusé de réception vide les files d'attente des relais — seulement s'il vient bien du destinataire du message
+        // (sinon n'importe qui pouvait faire effacer un message en transit). Le mien est traité par la messagerie.
+        if (f.type == Frame.ACK && f.payload.size >= 16) {
+            val target = Hex.enc(f.payload.copyOfRange(0, 16))
+            val o = db.outboxRow(target)
+            if (o != null && !o.mine && o.dest == f.fromHex) db.removeOutbox(target)
+        }
         // Relais : tout ce qui est relayable et pas uniquement pour moi, tant qu'il reste des sauts.
         if (f.relayable && f.ttl > 0 && (f.isBroadcast || f.toHex != me.id)) {
             val fwd = f.forwarded()
             val o = Outbox(fid, fwd.encode(), fwd.toHex, now, mutableSetOf(fromPeer, f.fromHex), mine = false)
             lock.withLock { db.saveOutbox(o) }
-            scope.launch { flush() } // hors du fil de réception : il relit la file (parfois des Mo) et ne doit pas retarder les trames suivantes
+            requestFlush() // hors du fil de réception, et une seule fois même si dix trames arrivent d'un coup
         }
     }
 
@@ -243,34 +303,64 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     }
 
     /** Vide la file d'attente vers les voisins connectés qui n'ont pas encore reçu chaque trame. */
-    suspend fun flush() = lock.withLock {
+    suspend fun flush(): Unit = lock.withLock {
         val connected = connectedPeerIds()
-        if (connected.isEmpty()) return@withLock
         val now = System.currentTimeMillis()
+        // Voisin parti : ce qui venait de lui être confié est remis en attente. Voisin toujours là et file du transport vide :
+        // on considère arrivé ce qui a été confié il y a plus d'une minute. (Avant de lire la file, pour qu'elle soit à jour.)
+        for ((p, m) in inFlight.entries.toList()) {
+            if (p !in connected) try { rearm(p) } catch (e: Exception) { Log.e(tag, "réarmement", e) }
+            else if (backlog(p) == 0) { m.entries.removeAll { now - it.value > 60_000 }; if (m.isEmpty()) inFlight.remove(p, m) }
+        }
+        // La liste ne contient que les tailles : le contenu d'une trame n'est lu que s'il y a quelqu'un à qui l'envoyer.
         val entries = try { db.outbox() } catch (e: Exception) { Log.e(tag, "file d'attente", e); emptyList() }
+        val broadcast = Hex.enc(Frame.BROADCAST)
+        // Voisins qui viennent de refuser une grosse trame (pas de prise Wi-Fi ouverte) : inutile de relire les suivantes pour eux.
+        val refusedBig = HashSet<String>()
+        if (wifiOnly.size > 2000) wifiOnly.clear()
         for (o in entries) try {
             // Ce que je relaie pour d'autres : 14 jours (petits messages), 3 jours (photos), 24 h (vidéos) ; le mien 30 jours (purge).
-            val keep = when { o.data.size > 1_000_000 -> 24 * 3600_000L; o.data.size > 50_000 -> 3 * 24 * 3600_000L; else -> 14 * 24 * 3600_000L }
+            // (Ces délais s'appliquent aussi quand personne n'est à portée.)
+            val keep = when { o.size > 1_000_000 -> 24 * 3600_000L; o.size > 50_000 -> 3 * 24 * 3600_000L; else -> 14 * 24 * 3600_000L }
             if (!o.mine && now - o.created > keep) { db.removeOutbox(o.fid); continue }
-            val isDirect = o.dest != Hex.enc(Frame.BROADCAST)
+            if (connected.isEmpty()) continue
+            val isDirect = o.dest != broadcast
             var changed = false
-            // Mon message privé remis au destinataire mais toujours sans accusé après 2 min : on le lui redonne (il renverra l'accusé).
-            if (o.mine && isDirect && o.dest in o.sentTo && o.dest in connected) {
+            // Mon message privé remis au destinataire mais toujours sans accusé après 2 min : on le lui redonne (il renverra l'accusé)
+            // — sauf s'il attend encore dans la file du transport (liaison lente) : inutile de l'empiler deux fois.
+            if (o.mine && isDirect && o.dest in o.sentTo && o.dest in connected && backlog(o.dest) == 0) {
                 val last = lastDirectSend[o.fid] ?: 0L
                 if (now - last > 120_000) { o.sentTo.remove(o.dest); changed = true }
             }
+            var data: ByteArray? = null
             for (p in connected) {
                 if (p in o.sentTo) continue
-                if (sendTo(p, o.data)) { o.sentTo.add(p); changed = true; if (p == o.dest) lastDirectSend[o.fid] = now; MeshService.instance?.messenger?.onRelayed(o, p) }
+                // Frein : on ne confie pas plus de ~500 Ko d'avance à un voisin (sinon toute la file part en mémoire
+                // face à une liaison Bluetooth lente). Les petits messages passent toujours.
+                if (o.size > 4096 && backlog(p) > MAX_BACKLOG) continue
+                if (o.size > 600 && p in refusedBig) continue
+                if (o.fid in wifiOnly && !hasWifiLink(p)) continue // vidéo : Wi-Fi direct seulement
+                val d = data ?: db.outboxData(o.fid)?.also { data = it } ?: break
+                if (d.size > 6 && (d[6].toInt() and Frame.FLAG_WIFI_ONLY) != 0) { wifiOnly.add(o.fid); if (!hasWifiLink(p)) continue }
+                if (!sendTo(p, d)) { if (d.size > 600) refusedBig.add(p) }
+                else {
+                    o.sentTo.add(p); changed = true
+                    inFlight.getOrPut(p) { ConcurrentHashMap() }[o.fid] = now
+                    if (p == o.dest) lastDirectSend[o.fid] = now
+                    MeshService.instance?.messenger?.onRelayed(o, p)
+                }
             }
             if (changed) db.outboxSentTo(o.fid, o.sentTo)
-            // Une trame directe remise au destinataire (relais ou trame technique) n'a plus besoin d'attendre.
-            if (isDirect && o.dest in o.sentTo && !o.mine) db.removeOutbox(o.fid)
+            // Une trame directe remise au destinataire (relais ou trame technique) n'a plus besoin d'attendre — une fois
+            // qu'elle est vraiment partie (pas seulement mise en file : si la liaison tombait avant, elle était perdue).
+            if (isDirect && o.dest in o.sentTo && !o.mine && inFlight[o.dest]?.containsKey(o.fid) != true) db.removeOutbox(o.fid)
         } catch (e: Exception) { Log.e(tag, "envoi ${o.fid}", e) }
+        if (lastDirectSend.size > 2000) lastDirectSend.entries.removeAll { now - it.value > 3600_000 }
         pendingCount.value = db.outboxCount()
         pendingDetail.value = db.outboxDetail()
     }
 
     fun myId() = me.id
+    private companion object { const val MAX_BACKLOG = 512_000 }
     fun myIdBytes() = myIdBytes
 }

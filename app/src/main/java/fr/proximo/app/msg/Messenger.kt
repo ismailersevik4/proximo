@@ -26,6 +26,7 @@ import fr.proximo.app.core.Settings
 import fr.proximo.app.mesh.Frame
 import fr.proximo.app.mesh.MeshCore
 import fr.proximo.app.mesh.Peer
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -39,6 +40,13 @@ import java.util.concurrent.ConcurrentHashMap
  * et range dans la base ce qui arrive du réseau.
  */
 class Messenger(private val ctx: Context, private val core: MeshCore) {
+    init {
+        // L'appli s'est arrêtée pendant la sonnerie d'un wizz : le volume d'alarme est remis comme il était.
+        try {
+            val v = Settings.get(ctx).wizzRestoreVolume
+            if (v >= 0) { (ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)?.setStreamVolume(AudioManager.STREAM_ALARM, v, 0); Settings.get(ctx).wizzRestoreVolume = -1 }
+        } catch (_: Exception) {}
+    }
     companion object {
         /** Un wizz toutes les 30 s au plus vers un même contact. */
         const val WIZZ_EVERY_MS = 30_000L
@@ -46,13 +54,17 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         const val WIZZ_FRESH_MS = 10 * 60_000L
         /** Côté réception : pas deux sonneries du même contact à moins de 20 s. */
         const val WIZZ_RING_GAP_MS = 20_000L
+        private const val GINV = "ginv"
+        private val HEX16 = Regex("^[0-9a-f]{16}$")
     }
     private val tag = "ProximoMsg"
     private val db = Db.get(ctx)
     private val me = Identity.get(ctx)
     private val settings = Settings.get(ctx)
     private val mediaDir = File(ctx.filesDir, "media").also { it.mkdirs() }
-    private val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+    private val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.CoroutineExceptionHandler { _, e -> Log.e(tag, "tâche de fond", e) })
+    /** Arrêt du réseau : plus aucune tâche de fond de cette messagerie. */
+    fun stop() { try { scope.cancel() } catch (_: Exception) {} }
 
     /** Cartes (clés publiques) des téléphones vus, même pas encore contacts. */
     val cards = ConcurrentHashMap<String, Card>()
@@ -60,6 +72,9 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private val wantContact = ConcurrentHashMap.newKeySet<String>()
     /** Discussion ouverte à l'écran (pas de notification pour elle). */
     @Volatile var openChat: String? = null
+        set(v) { field = v; if (v != null) try { NotificationManagerCompat.from(ctx).cancel(v.hashCode()) } catch (_: Exception) {} } // discussion ouverte : sa notification s'en va
+    /** La discussion est-elle vraiment sous les yeux de l'utilisateur ? (ouverte ET appli au premier plan, écran allumé) */
+    private fun isShowing(chat: String) = openChat == chat && MainActivity.isForeground
     /** Dernier événement à afficher en bandeau (ex. demande de contact). Le numéro évite qu'un même texte répété soit ignoré. */
     data class Event(val n: Long, val text: String)
     val events = MutableStateFlow<Event?>(null)
@@ -72,7 +87,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     fun sendPhoto(chat: String, jpeg: ByteArray) = sendMessage(chat, Message.PHOTO, "", jpeg)
     fun sendVoice(chat: String, audio: ByteArray, seconds: Int) = sendMessage(chat, Message.VOICE, seconds.toString(), audio)
     /** Vidéo courte : uniquement par Wi-Fi direct, un seul relais au maximum. */
-    fun sendVideo(chat: String, mp4: ByteArray, seconds: Int) = sendMessage(chat, Message.VIDEO, seconds.toString(), mp4, flags = Frame.FLAG_WIFI_ONLY, ttl = 2)
+    fun sendVideo(chat: String, mp4: ByteArray, seconds: Int) = sendMessage(chat, Message.VIDEO, seconds.toString(), mp4, flags = Frame.FLAG_WIFI_ONLY, ttl = 1) // ttl 1 = un seul relais (2 en permettait deux)
 
     /** Peut-on envoyer une vidéo vers cette discussion maintenant ? (il faut une prise Wi-Fi direct) */
     fun canSendVideo(chat: String): Boolean = when {
@@ -93,18 +108,21 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     /** Wizz : uniquement en privé, un toutes les 30 s par contact. Le texte « Wizz ! » reste lisible sur une ancienne version. */
     fun sendWizz(chat: String) {
         if (chat == Db.ALL || db.group(chat) != null) { event("Le wizz ne marche qu'en discussion privée"); return }
-        val now = System.currentTimeMillis()
-        val wait = WIZZ_EVERY_MS - (now - (wizzSentAt[chat] ?: 0L))
+        if (db.contact(chat)?.accepted != true) { event("Le wizz marchera quand le contact aura accepté"); return }
+        // Horloge « depuis l'allumage » : la limite de 30 s ne se dérègle pas si l'heure du téléphone change.
+        val now = android.os.SystemClock.elapsedRealtime()
+        val last = wizzSentAt[chat]
+        val wait = if (last == null) 0L else WIZZ_EVERY_MS - (now - last)
         if (wait > 0) { event("Attends encore ${(wait + 999) / 1000} s avant un nouveau wizz"); return }
         wizzSentAt[chat] = now
         sendMessage(chat, Message.WIZZ, "Wizz !", null)
         shake(chat)
-        event("Wizz envoyé")
+        event(if (core.peer(chat)?.linked == true) "Wizz envoyé" else "Wizz en attente : il ne sonnera que s'il arrive dans les 10 minutes")
     }
 
     /** SOS : à tout le monde, prioritaire, avec ma position si on l'a. */
     fun sendSos(text: String, lat: Double?, lon: Double?) {
-        val body = JSONObject().put("t", text).apply { if (lat != null && lon != null) put("lat", lat).put("lon", lon) }.toString()
+        val body = JSONObject().put("t", text.trim().take(500)).apply { if (lat != null && lon != null) put("lat", lat).put("lon", lon) }.toString()
         sendMessage(Db.ALL, Message.SOS, body, null)
     }
 
@@ -118,24 +136,28 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val mid = Hex.enc(fid)
         val time = System.currentTimeMillis()
         val inner = inner(mid, kind, body, time, blob)
+        // Un contact passe toujours avant un groupe : une discussion privée ne peut jamais partir vers un groupe du même identifiant.
+        val contact = if (chat == Db.ALL) null else db.contact(chat) ?: cards[chat]?.let { Contact(it.id, it.name, it.dhPub, it.sigPub, 0, 0, 0) }
+        val group = if (chat == Db.ALL || contact != null) null else db.group(chat)
         val frame: Frame? = when {
             chat == Db.ALL -> {
                 val sig = Crypto.sign(me.sigPriv, fid + inner)
                 Frame(if (kind == Message.SOS) Frame.SOS else Frame.PUBLIC, ttl, 0, flags, fid, core.myIdBytes(), Frame.BROADCAST, inner + sig)
             }
-            db.group(chat) != null -> {
-                val g = db.group(chat)!!
+            group != null -> {
+                val g = group
                 Frame(Frame.GROUP, ttl, 0, flags, fid, core.myIdBytes(), Frame.BROADCAST, Hex.dec(g.id) + Crypto.aesEncrypt(g.key, inner, fid))
             }
             else -> {
-                val c = db.contact(chat) ?: cards[chat]?.let { Contact(it.id, it.name, it.dhPub, it.sigPub, 0, 0, 0) }
+                val c = contact
                 if (c == null) { event("Impossible d'écrire : contact inconnu"); return }
                 val to = Hex.dec(c.id)
                 Frame(Frame.DM, ttl, 0, flags, fid, core.myIdBytes(), to, Crypto.sealFor(c.dhPub, inner, fid + core.myIdBytes() + to))
             }
         }
         val file = blob?.let { saveBlob(mid, kind, it) }
-        db.saveMessage(Message(mid, chat, me.id, true, kind, body, file, time, Message.PENDING, true, ""))
+        // L'invitation de groupe est une trame technique : elle ne s'affiche pas comme un message (elle montrait la clé du groupe en clair).
+        if (kind != GINV) db.saveMessage(Message(mid, chat, me.id, true, kind, body, file, time, Message.PENDING, true, ""))
         frame?.let { core.send(it) }
     }
 
@@ -144,6 +166,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val blobHash = Hex.enc(Crypto.sha256(blob ?: ByteArray(0)))
         val sig = Crypto.sign(me.sigPriv, "$mid|$kind|$body|$time|$blobHash".toByteArray())
         val json = JSONObject().put("k", kind).put("b", body).put("t", time).put("n", me.name).put("s", B64.enc(sig)).toString().toByteArray()
+        require(json.size <= 0xFFFF) { "message trop long" }
         val b = ByteBuffer.allocate(2 + json.size + (blob?.size ?: 0))
         b.putShort(json.size.toShort()).put(json)
         if (blob != null) b.put(blob)
@@ -260,7 +283,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
 
     private fun shareGroup(g: Group, to: List<String>) {
         val body = JSONObject().put("id", g.id).put("name", g.name).put("key", B64.enc(g.key)).put("owner", g.owner).put("members", JSONArray(g.members)).toString()
-        for (m in to) sendMessage(m, "ginv", body, null)
+        for (m in to) sendMessage(m, GINV, body, null)
     }
 
     // =============== côté réseau ===============
@@ -314,9 +337,14 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private fun onContactAccept(f: Frame) {
         val card = cardOf(f) ?: return
         cards[card.id] = card
+        // Une « acceptation » ne vaut que si JE lui ai demandé (demande envoyée) ou si on est déjà en contact.
+        // Sans ça, n'importe quel téléphone pouvait se déclarer « accepté » tout seul.
+        val existing = db.contact(card.id)
+        if (existing == null || existing.status == 2) return
         db.saveContact(card, 1)
         core.replayHeld(card.id)
-        db.saveMessage(Message(Hex.enc(Frame.newId()), card.id, card.id, false, Message.SYS, "${card.name} a accepté ta demande", null, System.currentTimeMillis(), Message.DELIVERED, openChat == card.id, ""))
+        if (existing.accepted) return // déjà en contact : pas de deuxième « a accepté ta demande »
+        db.saveMessage(Message(Hex.enc(Frame.newId()), card.id, card.id, false, Message.SYS, "${card.name} a accepté ta demande", null, System.currentTimeMillis(), Message.DELIVERED, isShowing(card.id), ""))
         notify("Contact accepté", "${card.name} a accepté ta demande", card.id, false)
     }
 
@@ -337,8 +365,9 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val senderName = contact?.name ?: inn.json.optString("n", "Inconnu")
         // Accusé de réception : repart vers l'émetteur par le réseau.
         core.send(Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, f.fid + byteArrayOf(f.hops.toByte())))
+        db.markAcked(f.fidHex) // si l'expéditeur ne reçoit pas cet accusé et renvoie le message, on saura le lui redonner
         when (kind) {
-            "ginv" -> onGroupInvite(from, inn.json.optString("b"))
+            GINV -> onGroupInvite(from, inn.json.optString("b"))
             else -> store(f, from, from, senderName, inn, kind)
         }
         return true
@@ -347,10 +376,17 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private fun onGroupInvite(from: String, body: String) {
         try {
             val o = JSONObject(body)
-            val arr = o.getJSONArray("members"); val m = ArrayList<String>(); for (i in 0 until arr.length()) m.add(arr.getString(i))
-            val existing = db.group(o.getString("id"))
+            val arr = o.getJSONArray("members"); if (arr.length() > 500) return
+            val m = ArrayList<String>(); for (i in 0 until arr.length()) m.add(arr.getString(i))
+            val id = o.getString("id"); val key = B64.dec(o.getString("key")); val name = o.getString("name").trim().take(60)
+            // Invitation vérifiée : un vrai identifiant de groupe, une vraie clé, envoyée par le créateur du groupe,
+            // et jamais l'identifiant d'un téléphone (sinon une discussion privée pouvait être détournée vers ce « groupe »).
+            if (!HEX16.matches(id) || key.size != 32 || name.isEmpty()) return
+            if (id == me.id || db.contact(id) != null || cards.containsKey(id)) return
+            if (o.getString("owner") != from || me.id !in m) return
+            val existing = db.group(id)
             if (existing != null && existing.owner != from) return
-            val g = Group(o.getString("id"), o.getString("name"), B64.dec(o.getString("key")), o.getString("owner"), m, System.currentTimeMillis())
+            val g = Group(id, name, key, from, m, System.currentTimeMillis())
             db.saveGroup(g)
             core.replayHeld(null)
             if (existing == null) {
@@ -398,7 +434,12 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         if (f.payload.size < 16) return
         val mid = Hex.enc(f.payload.copyOfRange(0, 16))
         val hops = if (f.payload.size > 16) f.payload[16].toInt() and 0xff else 0
-        db.setStatus(mid, Message.DELIVERED, if (hops <= 1) "Reçu en direct" else "Reçu après $hops sauts")
+        // L'accusé ne compte que s'il vient du destinataire de CE message (un autre téléphone ne peut pas le marquer « Reçu »).
+        val m = db.message(mid)
+        val o = db.outboxRow(mid)
+        val fromDest = (m != null && m.mine && m.chat == f.fromHex) || (o != null && o.mine && o.dest == f.fromHex)
+        if (!fromDest) return
+        if (m != null) db.setStatus(mid, Message.DELIVERED, if (hops <= 1) "Reçu en direct" else "Reçu après $hops sauts")
         db.removeOutbox(mid)
     }
 
@@ -407,10 +448,11 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         if (db.message(mid) != null) return
         val body = inn.json.optString("b")
         val file = inn.blob?.let { saveBlob(mid, kind, it) }
-        val isOpen = openChat == chat
+        val isOpen = isShowing(chat)
         val route = if (f.hops == 0) "direct" else "${f.hops} saut(s)"
-        val sentAt = inn.json.optLong("t", System.currentTimeMillis())
         val now = System.currentTimeMillis()
+        // Une heure d'envoi « dans le futur » (horloge de l'expéditeur en avance) est ramenée à maintenant.
+        val sentAt = inn.json.optLong("t", now).coerceAtMost(now)
         db.saveMessage(Message(mid, chat, from, false, kind, body, file, sentAt, Message.DELIVERED, isOpen, route, senderName, now))
         val late = now - sentAt > 3600_000L
         db.touchContact(from)
@@ -420,7 +462,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         }
         val title = if (chat == Db.ALL) "$senderName · Tout le monde" else if (db.group(chat) != null) "$senderName · ${db.group(chat)?.name}" else senderName
         if (kind != Message.SOS && !isOpen) notify(if (late) "$title · écrit le ${java.text.SimpleDateFormat("d MMM HH:mm", java.util.Locale.FRANCE).format(java.util.Date(sentAt))}" else title, preview, chat, false)
-        if (kind == Message.VOICE && file != null && settings.autoPlayVoice) playVoice(file)
+        if (kind == Message.VOICE && file != null && settings.autoPlayVoice) queueVoice(file)
     }
 
     /**
@@ -428,10 +470,11 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
      * Arrivé plus de 10 min après (ou hors discussion privée) : simple notification muette, sans sonnerie.
      */
     private fun onWizz(chat: String, from: String, senderName: String, ageMs: Long, isOpen: Boolean) {
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
         val direct = chat == from && db.contact(from)?.accepted == true
         val fresh = ageMs <= WIZZ_FRESH_MS
-        val ring = direct && fresh && now - (wizzRungAt[from] ?: 0L) >= WIZZ_RING_GAP_MS
+        val lastRing = wizzRungAt[from]
+        val ring = direct && fresh && (lastRing == null || now - lastRing >= WIZZ_RING_GAP_MS)
         if (ring) { wizzRungAt[from] = now; ringWizz(); shake(chat) }
         if (!isOpen) notify(senderName, if (fresh) "👋 Wizz !" else "👋 Wizz (arrivé en retard)", chat, false, silent = true)
     }
@@ -448,19 +491,23 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
             else vib?.vibrate(effect, AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
         } catch (e: Exception) { Log.w(tag, "vibration wizz", e) }
         // Pendant un appel, on ne couvre pas la voix : vibration seulement.
-        val inCall = try { fr.proximo.app.mesh.MeshService.instance?.calls?.state?.value?.phase == fr.proximo.app.call.CallState.ACTIVE } catch (_: Exception) { false }
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        // (Un appel Proximo, téléphonique ou d'une autre appli est en cours : on ne couvre pas la voix.)
+        val inCall = try {
+            fr.proximo.app.mesh.MeshService.instance?.calls?.state?.value?.phase == fr.proximo.app.call.CallState.ACTIVE ||
+                am?.mode == AudioManager.MODE_IN_CALL || am?.mode == AudioManager.MODE_IN_COMMUNICATION
+        } catch (_: Exception) { false }
         if (inCall) return
         if (wizzRinging) return
         wizzRinging = true
         var restore: Int? = null
-        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         try {
             // Volume d'alarme trop bas ou à zéro : on le remonte le temps du wizz, puis on le remet comme avant.
             if (am != null) {
                 val max = am.getStreamMaxVolume(AudioManager.STREAM_ALARM)
                 val cur = am.getStreamVolume(AudioManager.STREAM_ALARM)
                 val want = (max * 7 + 9) / 10
-                if (cur < want) { am.setStreamVolume(AudioManager.STREAM_ALARM, want, 0); restore = cur }
+                if (cur < want) { settings.wizzRestoreVolume = cur; am.setStreamVolume(AudioManager.STREAM_ALARM, want, 0); restore = cur }
             }
         } catch (e: Exception) { Log.w(tag, "volume wizz", e) }
         var tg: ToneGenerator? = null
@@ -473,6 +520,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         mainHandler.postDelayed({
             try { gen?.release() } catch (_: Exception) {}
             try { restore?.let { am?.setStreamVolume(AudioManager.STREAM_ALARM, it, 0) } } catch (_: Exception) {}
+            settings.wizzRestoreVolume = -1
             wizzRinging = false
         }, 2400)
     }
@@ -512,15 +560,31 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         } catch (_: Exception) {}
     }
 
-    private fun playVoice(path: String) {
+    /** Vocaux à lire : l'un après l'autre (plusieurs vocaux arrivés ensemble ne se superposent plus). */
+    private val voiceQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()
+    private val voicePlaying = java.util.concurrent.atomic.AtomicBoolean(false)
+    private fun queueVoice(path: String) {
+        if (voiceQueue.size >= 20) return
+        voiceQueue.add(path)
+        mainHandler.post { playNextVoice() }
+    }
+    private fun playNextVoice() {
+        if (!voicePlaying.compareAndSet(false, true)) return
+        val path = voiceQueue.poll()
+        if (path == null) { voicePlaying.set(false); return }
+        var done = false
+        val next = Runnable { if (!done) { done = true; voicePlaying.set(false); playNextVoice() } }
         try {
             beep(AudioManager.STREAM_MUSIC, ToneGenerator.TONE_PROP_BEEP, 150)
             val mp = MediaPlayer()
             mp.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
             mp.setDataSource(path)
-            mp.setOnCompletionListener { it.release(); beep(AudioManager.STREAM_MUSIC, ToneGenerator.TONE_PROP_BEEP2, 200) }
+            mp.setOnCompletionListener { it.release(); beep(AudioManager.STREAM_MUSIC, ToneGenerator.TONE_PROP_BEEP2, 200); mainHandler.postDelayed(next, 400) }
+            mp.setOnErrorListener { p, _, _ -> try { p.release() } catch (_: Exception) {}; mainHandler.post(next); true }
             mp.setOnPreparedListener { it.start() }
             mp.prepareAsync()
-        } catch (e: Exception) { Log.w(tag, "lecture vocal", e) }
+            // Garde-fou : si le lecteur ne rend jamais la main, la file repart au bout de 70 s (un vocal dure 60 s au plus).
+            mainHandler.postDelayed(next, 70_000)
+        } catch (e: Exception) { Log.w(tag, "lecture vocal", e); mainHandler.post(next) }
     }
 }

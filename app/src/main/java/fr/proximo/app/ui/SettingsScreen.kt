@@ -59,10 +59,10 @@ fun SettingsScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(14.dp))
             Section("Réseau et mises à jour") {
                 SwitchRow("Démarrer avec le téléphone", "Le réseau Proximo se lance tout seul au démarrage.", settings.autoStart) { settings.autoStart = it }
-                SwitchRow("Partager ma version aux voisins", "Un voisin qui a une version plus ancienne peut récupérer l'appli depuis mon téléphone (Wi-Fi direct).", settings.shareUpdates) { settings.shareUpdates = it }
+                SwitchRow("Partager ma version aux voisins", "Un voisin qui a une version plus ancienne peut récupérer l'appli depuis mon téléphone (Wi-Fi direct ou Bluetooth).", settings.shareUpdates) { settings.shareUpdates = it }
                 Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Text("Version installée", color = Color.White); Text("Appli ${BuildConfig.VERSION_NAME} · APK ${BuildConfig.VERSION_CODE}", color = Px.Muted, fontSize = 12.sp) }
-                    TextButton(onClick = { svc?.updater?.checkOnline(); svc?.messenger?.event("Vérification en cours…") }) { Text("Vérifier") }
+                    TextButton(onClick = { svc?.messenger?.event("Vérification en cours…"); svc?.updater?.checkOnline(manual = true) }) { Text("Vérifier") }
                 }
                 Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Text("Chercher une mise à jour chez les voisins", color = Color.White); Text("Demande aux téléphones à portée s'ils ont une version plus récente (Wi-Fi direct ou Bluetooth).", color = Px.Muted, fontSize = 12.sp) }
@@ -72,13 +72,16 @@ fun SettingsScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(14.dp))
             Section("Réseau") {
                 val act = ctx as? fr.proximo.app.MainActivity
-                val exempt = act?.batteryExempt() ?: true
+                val exempt = act?.batteryOk ?: true // relu à chaque retour dans l'appli
                 Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(if (exempt) "Arrière-plan autorisé ✓" else "Arrière-plan : à autoriser", color = if (exempt) Color.White else Px.Warn)
                         Text(if (exempt) "Android ne met pas Proximo en veille. Sur Samsung, vérifie aussi « Applications jamais mises en veille »." else "Sans ça, les messages n'arrivent plus quand l'écran est éteint.", color = Px.Muted, fontSize = 12.sp)
                     }
-                    TextButton(onClick = { act?.requestBatteryExemption() }) { Text(if (exempt) "Réglages" else "Autoriser") }
+                    TextButton(onClick = {
+                        if (!exempt) act?.requestBatteryExemption()
+                        else try { ctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (e: Exception) { act?.openAppSettings() }
+                    }) { Text(if (exempt) "Réglages" else "Autoriser") }
                 }
                 val stopped = settings.stoppedManually
                 Row(Modifier.fillMaxWidth().padding(16.dp, 10.dp), verticalAlignment = Alignment.CenterVertically) {

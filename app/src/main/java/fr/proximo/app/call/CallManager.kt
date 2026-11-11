@@ -79,10 +79,14 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
 
     private fun contactKey(peerId: String): ByteArray? = db.contact(peerId)?.dhPub ?: MeshService.instance?.messenger?.cards?.get(peerId)?.dhPub
 
+    private fun micOk() = androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
     fun call(peerId: String) {
         if (state.value.phase != CallState.IDLE) return
+        if (!micOk()) { MeshService.instance?.messenger?.event("Micro refusé : autorise-le dans les réglages Android de Proximo pour appeler"); return }
         val name = db.contact(peerId)?.name ?: core.peer(peerId)?.name ?: "Contact"
         if (contactKey(peerId) == null) { MeshService.instance?.messenger?.event("Ajoute d'abord $name en contact pour l'appeler"); return }
+        if (db.contact(peerId)?.accepted != true) { MeshService.instance?.messenger?.event("L'appel marchera quand $name sera dans tes contacts (demande acceptée)"); return }
         if (core.hasWifiLink(peerId)) { startOutgoing(peerId, name, null); return }
         // Pas de prise directe : on demande aux voisins Wi-Fi s'ils ont une prise avec lui.
         val candidates = core.wifiLinkedPeers().filter { it != peerId }
@@ -96,6 +100,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     }
 
     private fun startOutgoing(peerId: String, name: String, via: String?) {
+        handler.removeCallbacksAndMessages(null) // les minuteries d'un appel précédent ne doivent pas raccrocher celui-ci
         salt = Crypto.random(7); mySalt = Crypto.random(16); peerSalt = ByteArray(0); sendDir = 1; seq = 0; lastRecvSeq = -1
         key = null // la clé sera dérivée quand l'appelé aura renvoyé son aléa (accept)
         val viaName = via?.let { db.contact(it)?.name ?: core.peer(it)?.name }
@@ -107,6 +112,8 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
 
     fun accept() {
         val s = state.value; if (s.phase != CallState.RINGING_IN) return
+        if (!micOk()) { MeshService.instance?.messenger?.event("Micro refusé : autorise-le dans les réglages Android de Proximo pour répondre"); reject(); return }
+        handler.removeCallbacksAndMessages(null)
         stopRing()
         mySalt = Crypto.random(16)
         key = deriveKey(s.peerId, peerSalt, mySalt)
@@ -117,6 +124,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
 
     fun reject() {
         val s = state.value; if (s.phase != CallState.RINGING_IN) return
+        handler.removeCallbacksAndMessages(null)
         stopRing(); sendJson(s.peerId, JSONObject().put("c", "reject"), s.via)
         state.value = CallState(CallState.IDLE, "", "", 0)
         NotificationManagerCompat.from(ctx).cancel(NOTIF)
@@ -208,11 +216,23 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                 peerSalt = try { B64.dec(j.optString("ks")) } catch (e: Exception) { ByteArray(0) }
                 // Invitation sans aléa valide (ancienne version ou trame abîmée) : refusée, jamais de clé prévisible.
                 if (salt.size != 7 || peerSalt.size != 16 || contactKey(from) == null) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
+                // Seuls mes contacts peuvent faire sonner le téléphone (ou tout le monde si j'accepte les messages privés des inconnus).
+                if (db.contact(from)?.accepted != true && !fr.proximo.app.core.Settings.get(ctx).allowUnknownDm) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
                 sendDir = 2; seq = 0; lastRecvSeq = -1
                 key = null
                 val viaName = useVia?.let { db.contact(it)?.name ?: core.peer(it)?.name }
                 state.value = CallState(CallState.RINGING_IN, from, name, System.currentTimeMillis(), via = useVia, viaName = viaName)
                 ring(); notifyIncoming(name)
+                // Personne ne décroche, ou l'appelant est parti sans pouvoir le dire : la sonnerie s'arrête au bout d'une minute.
+                val since = state.value.since
+                handler.postDelayed({
+                    val st = state.value
+                    if (st.phase == CallState.RINGING_IN && st.peerId == from && st.since == since) {
+                        stopRing(); NotificationManagerCompat.from(ctx).cancel(NOTIF)
+                        state.value = CallState(CallState.IDLE, "", "", 0)
+                        MeshService.instance?.messenger?.event("Appel manqué de $name")
+                    }
+                }, 60_000)
             }
             "accept" -> if (s.phase == CallState.RINGING_OUT && s.peerId == from) {
                 peerSalt = try { B64.dec(j.optString("ks")) } catch (e: Exception) { ByteArray(0) }
@@ -227,6 +247,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
 
     private fun startAudio(s: CallState) {
         state.value = s.copy(phase = CallState.ACTIVE, since = System.currentTimeMillis())
+        MeshService.instance?.setCallActive(true)
         NotificationManagerCompat.from(ctx).cancel(NOTIF)
         lastPacketAt = System.currentTimeMillis()
         watchdog()
@@ -276,6 +297,8 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     }
 
     private fun endCall() {
+        handler.removeCallbacksAndMessages(null)
+        val wasActive = state.value.phase == CallState.ACTIVE
         running.set(false)
         stopRing()
         try { record?.stop(); record?.release() } catch (_: Exception) {}
@@ -284,6 +307,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         try { audio.mode = AudioManager.MODE_NORMAL; audio.isSpeakerphoneOn = false } catch (_: Exception) {}
         NotificationManagerCompat.from(ctx).cancel(NOTIF)
         state.value = CallState(CallState.IDLE, "", "", 0)
+        if (wasActive) MeshService.instance?.setCallActive(false)
     }
 
     private fun ring() {

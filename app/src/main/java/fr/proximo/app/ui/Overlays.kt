@@ -2,6 +2,8 @@ package fr.proximo.app.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -93,7 +95,7 @@ fun UpdateBanner(modifier: Modifier) {
                 TextButton(onClick = { up.requestInstallPermission() }) { Text("Autoriser", fontWeight = FontWeight.Bold) }
             }
         }
-        msg?.let { Text(it, color = Px.Warn, fontSize = 13.sp, modifier = Modifier.clickable { up.dismiss() }) }
+        msg?.let { Text(it, color = Px.Warn, fontSize = 13.sp, modifier = Modifier.clickable { up.message.value = null }) } // toucher le texte l'efface, sans refuser la mise à jour pour 24 h
     }
 }
 
@@ -117,7 +119,8 @@ fun CallScreen(s: CallState) {
     val calls = svc?.calls
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(s.phase) { while (true) { delay(1000); now = System.currentTimeMillis() } }
-    Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
+    // Posé par-dessus l'appli : il prend tous les touchers (rien ne passe à l'écran du dessous).
+    Column(Modifier.fillMaxSize().background(Px.Bg).pointerInput(Unit) { detectTapGestures { } }.systemBarsPadding().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.SpaceBetween) {
         Spacer(Modifier.height(40.dp))
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Avatar(s.peerName, 110.dp, color = Px.Avatar, id = s.peerId)

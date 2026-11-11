@@ -4,6 +4,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -33,6 +38,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -76,12 +83,23 @@ fun AppRoot(activity: MainActivity) {
 
     // Ouverture d'une discussion depuis une notification
     LaunchedEffect(activity.pendingChat) {
-        activity.pendingChat?.let { c -> activity.pendingChat = null; if (c == "contacts") nav.navigate("contacts") else nav.navigate("chat/$c") }
+        activity.pendingChat?.let { c ->
+            activity.pendingChat = null
+            // Déjà sur cette discussion : on ne l'empile pas une deuxième fois.
+            val cur = nav.currentBackStackEntry
+            val already = if (c == "contacts") cur?.destination?.route == "contacts" else cur?.destination?.route == "chat/{id}" && cur.arguments?.getString("id") == c
+            if (!already) nav.navigate(if (c == "contacts") "contacts" else "chat/$c") { launchSingleTop = true }
+        }
     }
 
     val callFlow = svc?.calls?.state
     val call = if (callFlow != null) callFlow.collectAsState().value else null
-    if (call != null && call.phase != CallState.IDLE) { CallScreen(call); return }
+    // L'écran d'appel se pose PAR-DESSUS le reste (plus bas) : après l'appel, on retrouve l'écran et le texte en cours.
+    val inCall = call != null && call.phase != CallState.IDLE
+    val settingsTick by settings.changes.collectAsState()
+    val stopped = remember(settingsTick) { settings.stoppedManually }
+    // Service toujours absent 5 s après l'ouverture (ou arrêté à la main) : on le dit, au lieu de laisser des boutons sans effet.
+    val svcMissing by produceState(false, svc) { value = false; if (svc == null) { kotlinx.coroutines.delay(5000); value = true } }
 
     val showBar = route in setOf("radar", "chats", "all", "profile")
     Scaffold(
@@ -110,7 +128,7 @@ fun AppRoot(activity: MainActivity) {
             }
         },
     ) { pad ->
-        Box(Modifier.fillMaxSize().padding(pad)) {
+        Box(Modifier.fillMaxSize().padding(pad).consumeWindowInsets(pad)) {
             NavHost(nav, startDestination = "radar") {
                 composable("radar") { RadarScreen(onOpenChat = { nav.navigate("chat/$it") }) }
                 composable("chats") { ChatsScreen(onOpen = { nav.navigate("chat/$it") }, onNewGroup = { nav.navigate("newgroup") }, onAdd = { nav.navigate("contacts") }) }
@@ -123,14 +141,27 @@ fun AppRoot(activity: MainActivity) {
             }
             UpdateBanner(Modifier.align(Alignment.TopCenter))
             EventToast(Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp))
+            if (svc == null && (stopped || svcMissing)) Text(
+                if (stopped) "Réseau Proximo arrêté : rien ne part, rien n'arrive. Appuie ici pour le démarrer." else "Le réseau Proximo ne tourne pas. Appuie ici pour le démarrer.",
+                color = Color.White, fontSize = 14.sp, textAlign = TextAlign.Center,
+                modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth().background(Px.Danger).clickable { MeshService.resume(ctx) }.padding(12.dp),
+            )
         }
+    }
+    if (inCall && call != null) {
+        // Le clavier se ferme : il ne doit pas cacher « Répondre / Refuser ».
+        val focus = androidx.compose.ui.platform.LocalFocusManager.current
+        val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+        LaunchedEffect(Unit) { focus.clearFocus(force = true); keyboard?.hide() }
+        androidx.activity.compose.BackHandler {}
+        CallScreen(call)
     }
 }
 
 @Composable
 fun Onboarding(onDone: (String) -> Unit) {
-    var name by remember { mutableStateOf("") }
-    Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+    var name by rememberSaveable { mutableStateOf("") }
+    Column(Modifier.fillMaxSize().background(Px.Bg).systemBarsPadding().imePadding().verticalScroll(rememberScrollState()).padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Logo(120.dp)
         Spacer(Modifier.height(20.dp))
         Text("Proximo", color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)

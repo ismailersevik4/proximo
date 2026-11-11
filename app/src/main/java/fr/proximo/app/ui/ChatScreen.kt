@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Vibration
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
@@ -57,6 +58,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,10 +70,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import coil.compose.AsyncImage
+import fr.proximo.app.MainActivity
 import fr.proximo.app.core.Db
 import fr.proximo.app.core.Message
 import fr.proximo.app.mesh.MeshService
@@ -93,12 +99,15 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     val names by dbState(emptyMap<String, String>()) { d -> d.contacts().associate { c -> c.id to c.name } }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
-    var text by remember { mutableStateOf("") }
+    var text by rememberSaveable(chat) { mutableStateOf("") } // le brouillon survit à une rotation ou à un appel
     var recording by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var sosDialog by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
+    var leaveDialog by remember { mutableStateOf(false) }
     val recorder = remember { VoiceRecorder(ctx) }
+    // L'écran change pendant un enregistrement (appel entrant…) : le micro est toujours libéré.
+    DisposableEffect(Unit) { onDispose { recorder.cancel() } }
 
     val title = when { isAll -> "Tout le monde"; group != null -> group!!.name; else -> contact?.name ?: "Discussion" }
     val peer = peers.firstOrNull { it.id == chat }
@@ -110,9 +119,21 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     }
 
     // Marquer comme lu et dire à la messagerie que cette discussion est ouverte
-    LaunchedEffect(chat, messages.size) { withContext(Dispatchers.IO) { db.markRead(chat) } }
-    DisposableEffect(chat, svc) { svc?.messenger?.openChat = chat; onDispose { if (svc?.messenger?.openChat == chat) svc?.messenger?.openChat = null } }
-    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1) }
+    // (Seulement quand l'écran est vraiment affiché : téléphone en poche avec la discussion restée ouverte, les messages
+    //  doivent sonner, notifier et rester « non lus ».)
+    val lastMid = messages.lastOrNull()?.mid
+    LaunchedEffect(chat, lastMid) { if (MainActivity.isForeground) withContext(Dispatchers.IO) { db.markRead(chat) } }
+    LifecycleResumeEffect(chat, svc) {
+        val m = svc?.messenger
+        m?.openChat = chat
+        scope.launch(Dispatchers.IO) { db.markRead(chat) }
+        onPauseOrDispose { if (m?.openChat == chat) m.openChat = null }
+    }
+    // Aller en bas à chaque nouveau dernier message (y compris au-delà de 500 messages) ; sans animation à l'ouverture.
+    var firstScroll by remember(chat) { mutableStateOf(true) }
+    LaunchedEffect(lastMid) {
+        if (lastMid != null) { if (firstScroll) listState.scrollToItem(messages.size - 1) else listState.animateScrollToItem(messages.size - 1); firstScroll = false }
+    }
 
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) scope.launch { val b = withContext(Dispatchers.IO) { Photos.compress(ctx, uri) }; if (b != null) svc?.messenger?.sendPhoto(chat, b) }
@@ -122,7 +143,10 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         if (ok) scope.launch { val b = withContext(Dispatchers.IO) { Photos.compress(ctx, photoUri) }; if (b != null) svc?.messenger?.sendPhoto(chat, b) }
     }
-    val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) takePhoto.launch(photoUri) }
+    val cameraDenied = "Appareil photo refusé : autorise-le dans les réglages Android de Proximo"
+    val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) takePhoto.launch(photoUri) else svc?.messenger?.event(cameraDenied) }
+    val askLocation = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> svc?.messenger?.event(if (ok) "Position autorisée : appuie de nouveau sur « Ma position »" else "Position refusée : autorise-la dans les réglages Android de Proximo") }
+    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (!ok) svc?.messenger?.event("Micro refusé : autorise-le dans les réglages Android de Proximo") }
     // Vidéos : filmées directement en basse qualité (15 s), ou choisies dans la galerie si elles sont légères.
     val videoFile = remember { File(ctx.cacheDir, "video.mp4") }
     val videoUri = remember { FileProvider.getUriForFile(ctx, ctx.packageName + ".files", videoFile) }
@@ -130,14 +154,17 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         val (res, err) = withContext(Dispatchers.IO) { Videos.load(ctx, uri) }
         if (res != null) svc?.messenger?.sendVideo(chat, res.first, res.second) else svc?.messenger?.event(err ?: "Vidéo illisible")
     }
-    val captureVideo = rememberLauncherForActivityResult(object : ActivityResultContracts.CaptureVideo() {
-        override fun createIntent(context: android.content.Context, input: Uri): Intent = super.createIntent(context, input)
-            .putExtra(android.provider.MediaStore.EXTRA_DURATION_LIMIT, Videos.MAX_SECONDS)
-            .putExtra(android.provider.MediaStore.EXTRA_VIDEO_QUALITY, 0)
-            .putExtra(android.provider.MediaStore.EXTRA_SIZE_LIMIT, Videos.MAX_BYTES)
-    }) { ok -> if (ok) sendVideoFrom(videoUri) }
+    val videoContract = remember {
+        object : ActivityResultContracts.CaptureVideo() {
+            override fun createIntent(context: android.content.Context, input: Uri): Intent = super.createIntent(context, input)
+                .putExtra(android.provider.MediaStore.EXTRA_DURATION_LIMIT, Videos.MAX_SECONDS)
+                .putExtra(android.provider.MediaStore.EXTRA_VIDEO_QUALITY, 0)
+                .putExtra(android.provider.MediaStore.EXTRA_SIZE_LIMIT, Videos.MAX_BYTES)
+        }
+    }
+    val captureVideo = rememberLauncherForActivityResult(videoContract) { ok -> if (ok) sendVideoFrom(videoUri) }
     val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) sendVideoFrom(uri) }
-    val askCameraVideo = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) captureVideo.launch(videoUri) }
+    val askCameraVideo = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) captureVideo.launch(videoUri) else svc?.messenger?.event(cameraDenied) }
     fun videoGuard(action: () -> Unit) {
         if (svc?.messenger?.canSendVideo(chat) == true) action() else svc?.messenger?.event("Vidéo impossible pour l'instant : il faut une liaison Wi-Fi direct (le Bluetooth est trop lent). Envoie une photo ou un vocal.")
     }
@@ -161,13 +188,16 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             else Avatar(title, 42.dp, online = if (group != null) null else peer != null, square = group != null, id = if (group != null) null else chat)
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                Text(subtitle, color = if (peer != null || isAll || group != null) Px.AccentSoft else Px.Muted, fontSize = 12.sp)
+                Text(title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(subtitle, color = if (peer != null || isAll || group != null) Px.AccentSoft else Px.Muted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
             if (!isAll) Icon(Icons.Filled.Lock, "Chiffré", tint = Px.Accent, modifier = Modifier.size(18.dp))
             if (!isAll && group == null) {
-                val can = svc?.calls?.canCall(chat) == true
-                IconButton(onClick = { if (can) svc?.calls?.call(chat) else svc?.messenger?.event("Trop loin pour un appel (pas de Wi-Fi direct, même via un voisin) : utilise le talkie-walkie") }) {
+                // Recalculé toutes les 3 s hors du fil d'affichage (il interroge la base), et vérifié pour de bon au toucher.
+                val can by androidx.compose.runtime.produceState(false, svc, chat) {
+                    while (true) { value = withContext(Dispatchers.IO) { svc?.calls?.canCall(chat) == true }; kotlinx.coroutines.delay(3000) }
+                }
+                IconButton(onClick = { if (svc?.calls?.canCall(chat) == true) svc?.calls?.call(chat) else svc?.messenger?.event("Trop loin pour un appel (pas de Wi-Fi direct, même via un voisin) : utilise le talkie-walkie") }) {
                     Icon(Icons.Filled.Call, "Appeler", tint = if (can) Px.Accent else Px.Muted)
                 }
             }
@@ -177,7 +207,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                 DropdownMenu(menu, { menu = false }) {
                     if (group != null) DropdownMenuItem(text = { Text("Membres : " + group!!.members.joinToString { m -> names[m] ?: if (m == svc?.core?.myId()) "moi" else "?" }) }, onClick = { menu = false })
                     DropdownMenuItem(text = { Text("Effacer la discussion") }, onClick = { menu = false; clearDialog = true })
-                    if (group != null) DropdownMenuItem(text = { Text("Quitter le groupe", color = Px.Danger) }, onClick = { menu = false; svc?.messenger?.leaveGroup(chat); onBack?.invoke() })
+                    if (group != null) DropdownMenuItem(text = { Text("Quitter le groupe", color = Px.Danger) }, onClick = { menu = false; leaveDialog = true })
                 }
             }
         }
@@ -185,8 +215,8 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         // ---- messages ----
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState, contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp, 8.dp)) {
             itemsIndexed(messages, key = { _, m -> m.mid }) { i, m ->
-                val day = dayLabel(m.time)
-                if (i == 0 || dayLabel(messages[i - 1].time) != day) DaySeparator(day)
+                val day = dayLabel(m.shownAt)
+                if (i == 0 || dayLabel(messages[i - 1].shownAt) != day) DaySeparator(day)
                 Bubble(m, showName = isAll || group != null, contactName = { id -> names[id] ?: peers.firstOrNull { it.id == id }?.name })
             }
             if (messages.isEmpty()) item {
@@ -219,13 +249,17 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                     DropdownMenuItem(text = { Text("Vidéo de la galerie (3,5 Mo max)") }, leadingIcon = { Icon(Icons.Filled.Videocam, null) }, onClick = { attach = false; videoGuard { pickVideo.launch("video/*") } })
                     DropdownMenuItem(text = { Text("Ma position") }, leadingIcon = { Icon(Icons.Filled.Place, null) }, onClick = {
                         attach = false
-                        scope.launch { val l = Locations.current(ctx); if (l != null) svc?.messenger?.sendLocation(chat, l.latitude, l.longitude) else svc?.messenger?.event("Position introuvable (GPS éteint ?)") }
+                        if (!Locations.allowed(ctx)) askLocation.launch(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                        else {
+                            svc?.messenger?.event("Recherche de la position…")
+                            scope.launch { val l = Locations.current(ctx); if (l != null) svc?.messenger?.sendLocation(chat, l.latitude, l.longitude) else svc?.messenger?.event("Position introuvable (GPS éteint ?)") }
+                        }
                     })
                 }
             }
             Spacer(Modifier.width(6.dp))
             OutlinedTextField(
-                text, { text = it }, modifier = Modifier.weight(1f), placeholder = { Text(if (recording) "Enregistrement… relâche pour envoyer" else "Message…", color = Px.Muted) },
+                text, { text = it }, modifier = Modifier.weight(1f), placeholder = { Text(if (recording) "Parle… relâche pour envoyer" else "Message…", color = Px.Muted, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 singleLine = false, maxLines = 4, shape = RoundedCornerShape(22.dp),
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Default),
                 colors = OutlinedTextFieldDefaults.colors(focusedContainerColor = Px.Card, unfocusedContainerColor = Px.Card, focusedBorderColor = Px.Accent, unfocusedBorderColor = Px.Card2, cursorColor = Px.Accent, focusedTextColor = Color.White, unfocusedTextColor = Color.White),
@@ -241,10 +275,11 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                 Box(
                     Modifier.size(if (recording) 56.dp else 46.dp).background(if (recording) Px.Danger else Px.Card, CircleShape).pointerInput(Unit) {
                         detectTapGestures(onPress = {
+                            // Micro pas encore autorisé : on le demande (au lieu d'un « Micro indisponible » sans suite).
+                            if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) { askMic.launch(android.Manifest.permission.RECORD_AUDIO); return@detectTapGestures }
                             if (recorder.start()) {
                                 recording = true
-                                tryAwaitRelease()
-                                recording = false
+                                try { tryAwaitRelease() } finally { recording = false }
                                 val r = recorder.stop()
                                 if (r != null) svc?.messenger?.sendVoice(chat, r.first, r.second) else svc?.messenger?.event("Trop court : maintiens le bouton en parlant")
                             } else svc?.messenger?.event("Micro indisponible")
@@ -252,7 +287,11 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                     },
                     contentAlignment = Alignment.Center,
                 ) { Icon(Icons.Filled.Mic, "Talkie-walkie : maintenir pour parler", tint = if (recording) Color.White else Px.Accent) }
-            } else RoundButton(Icons.AutoMirrored.Filled.Send, "Envoyer", Px.Accent, Px.Bg) { svc?.messenger?.sendText(chat, text); text = "" }
+            } else RoundButton(Icons.AutoMirrored.Filled.Send, "Envoyer", Px.Accent, Px.Bg) {
+                // Réseau arrêté : le texte reste dans le champ au lieu de disparaître sans partir.
+                val m = svc?.messenger
+                if (m != null) { m.sendText(chat, text); text = "" }
+            }
         }
     }
 
@@ -266,13 +305,23 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         )
     }
 
+    if (leaveDialog) {
+        AlertDialog(
+            onDismissRequest = { leaveDialog = false }, containerColor = Px.Card,
+            title = { Text("Quitter le groupe ?", color = Color.White) },
+            text = { Text("Ses messages seront effacés de ce téléphone et tu ne pourras plus y revenir sans une nouvelle invitation.", color = Px.Muted) },
+            confirmButton = { TextButton(onClick = { leaveDialog = false; val m = svc?.messenger; if (m != null) { Thread { m.leaveGroup(chat) }.start(); onBack?.invoke() } }) { Text("Quitter", color = Px.Danger) } },
+            dismissButton = { TextButton(onClick = { leaveDialog = false }) { Text("Annuler", color = Px.Muted) } },
+        )
+    }
+
     if (sosDialog) {
         var sosText by remember { mutableStateOf("Besoin d'aide !") }
         AlertDialog(
             onDismissRequest = { sosDialog = false }, containerColor = Px.Card,
             title = { Text("Envoyer un SOS", color = Px.Danger, fontWeight = FontWeight.Bold) },
-            text = { Column { Text("Tous les téléphones à portée recevront une alerte sonore avec ta position.", color = Px.Muted); Spacer(Modifier.height(10.dp)); OutlinedTextField(sosText, { sosText = it }, singleLine = true, modifier = Modifier.fillMaxWidth()) } },
-            confirmButton = { TextButton(onClick = { sosDialog = false; scope.launch { val l = Locations.current(ctx); svc?.messenger?.sendSos(sosText, l?.latitude, l?.longitude) } }) { Text("ENVOYER LE SOS", color = Px.Danger, fontWeight = FontWeight.Bold) } },
+            text = { Column { Text(if (Locations.allowed(ctx)) "Tous les téléphones à portée recevront une alerte sonore avec ta position." else "Tous les téléphones à portée recevront une alerte sonore. Ta position ne sera pas jointe : elle n'est pas autorisée dans les réglages Android de Proximo.", color = Px.Muted); Spacer(Modifier.height(10.dp)); OutlinedTextField(sosText, { sosText = it }, singleLine = true, modifier = Modifier.fillMaxWidth()) } },
+            confirmButton = { TextButton(onClick = { sosDialog = false; scope.launch { val l = Locations.current(ctx, maxWaitMs = 3000); svc?.messenger?.sendSos(sosText, l?.latitude, l?.longitude) } }) { Text("ENVOYER LE SOS", color = Px.Danger, fontWeight = FontWeight.Bold) } },
             dismissButton = { TextButton(onClick = { sosDialog = false }) { Text("Annuler", color = Px.Muted) } },
         )
     }
@@ -318,14 +367,14 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
         Column(Modifier.widthIn(max = 300.dp).background(bg, shape).combinedClickable(onClick = {}, onLongClick = { menu = true }).padding(12.dp, 8.dp)) {
             if (showName && !m.mine) Text(contactName(m.from) ?: m.senderName.ifEmpty { "Inconnu" }, color = Px.Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             when (m.kind) {
-                Message.PHOTO -> m.file?.let { AsyncImage(File(it), "Photo", modifier = Modifier.fillMaxWidth().height(200.dp).background(Px.Card, RoundedCornerShape(12.dp)).clickable {
+                Message.PHOTO -> m.file?.let { AsyncImage(File(it), "Photo", modifier = Modifier.fillMaxWidth().height(200.dp).background(Px.Card, RoundedCornerShape(12.dp)).combinedClickable(onLongClick = { menu = true }) {
                     val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", File(it))
                     openSafely(ctx, Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                 }) }
                 Message.VOICE -> VoiceRow(m)
                 Message.VIDEO -> m.file?.let { path ->
                     val thumb by androidx.compose.runtime.produceState<android.graphics.Bitmap?>(null, path) { value = withContext(Dispatchers.IO) { Videos.thumbnail(path) } }
-                    Box(Modifier.fillMaxWidth().height(200.dp).background(Px.Card, RoundedCornerShape(12.dp)).clickable {
+                    Box(Modifier.fillMaxWidth().height(200.dp).background(Px.Card, RoundedCornerShape(12.dp)).combinedClickable(onLongClick = { menu = true }) {
                         val uri = FileProvider.getUriForFile(ctx, ctx.packageName + ".files", File(path))
                         openSafely(ctx, Intent(Intent.ACTION_VIEW).setDataAndType(uri, "video/mp4").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                     }, contentAlignment = Alignment.Center) {
@@ -336,7 +385,7 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                 }
                 Message.LOC -> {
                     val parts = m.body.split(",")
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.combinedClickable(onLongClick = { menu = true }) {
                         if (parts.size == 2) openSafely(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("geo:${parts[0]},${parts[1]}?q=${parts[0]},${parts[1]}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }) { Icon(Icons.Filled.Place, null, tint = Px.Accent); Spacer(Modifier.width(6.dp)); Text("Position partagée\nOuvrir dans Maps", color = Color.White, fontSize = 14.sp) }
                 }
@@ -352,7 +401,7 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                 else -> Text(m.body, color = Color.White, fontSize = 15.sp)
             }
             if (m.late) Text("Reçu ${stamp(m.received).lowercase()} · écrit ${stamp(m.time).lowercase()}", color = Px.Warn, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
-            Row(Modifier.fillMaxWidth().clickable { details = true }, horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().combinedClickable(onLongClick = { menu = true }) { details = true }, horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                 Text(stamp(m.time), color = if (m.mine) Px.AccentSoft else Px.Muted, fontSize = 11.sp)
                 if (m.mine) {
                     Spacer(Modifier.width(6.dp))
@@ -400,7 +449,7 @@ private fun VoiceRow(m: Message) {
             player.value = mp; playing = true
         } catch (e: Exception) { playing = false }
     }) {
-        Box(Modifier.size(36.dp).background(Color.White.copy(alpha = 0.15f), CircleShape), contentAlignment = Alignment.Center) { Icon(if (playing) Icons.Filled.Mic else Icons.Filled.PlayArrow, "Écouter", tint = Color.White) }
+        Box(Modifier.size(36.dp).background(Color.White.copy(alpha = 0.15f), CircleShape), contentAlignment = Alignment.Center) { Icon(if (playing) Icons.Filled.Stop else Icons.Filled.PlayArrow, "Écouter", tint = Color.White) }
         Spacer(Modifier.width(10.dp))
         Text("Vocal · ${m.body} s", color = Color.White, fontSize = 14.sp)
     }

@@ -3,12 +3,13 @@ package fr.proximo.app.core
 import android.content.Context
 import fr.proximo.app.mesh.Modes
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 
 /** Réglages de l'appli (stockage privé). */
 class Settings private constructor(ctx: Context) {
     private val p = ctx.getSharedPreferences("settings", Context.MODE_PRIVATE)
     val changes = MutableStateFlow(0L)
-    private fun bump() { changes.value = changes.value + 1 }
+    private fun bump() { changes.update { it + 1 } }
 
     /** Mode de connexion : NORMAL, PORTEE, BATTERIE. */
     var mode: Int
@@ -59,6 +60,11 @@ class Settings private constructor(ctx: Context) {
     var lastOfferedVersion: Int
         get() = p.getInt("lastOffered", 0)
         set(v) { p.edit().putInt("lastOffered", v).apply() }
+
+    /** Volume d'alarme à remettre après un wizz (-1 = rien à remettre) ; gardé sur disque au cas où l'appli s'arrête pendant la sonnerie. */
+    var wizzRestoreVolume: Int
+        get() = p.getInt("wizzRestoreVolume", -1)
+        set(v) { p.edit().putInt("wizzRestoreVolume", v).apply() }
 
     companion object {
         @Volatile private var inst: Settings? = null

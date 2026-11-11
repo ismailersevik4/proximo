@@ -105,7 +105,7 @@ private fun ChatRow(c: ChatSummary, online: Boolean?, peers: List<fr.proximo.app
         Column(Modifier.weight(1f)) {
             Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
                 Text(c.name, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                c.last?.let { Text(timeStr(it.time), color = if (c.unread > 0) Px.Accent else if (isAll) Px.AccentSoft else Px.Muted, fontSize = 12.sp) }
+                c.last?.let { Text(timeStr(it.shownAt), color = if (c.unread > 0) Px.Accent else if (isAll) Px.AccentSoft else Px.Muted, fontSize = 12.sp) }
             }
             Spacer(Modifier.height(2.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {

@@ -24,6 +24,8 @@ interface Transport {
     fun setMode(mode: Int)
     /** Vrai si une liaison à gros débit (prise Wi-Fi) est ouverte avec ce voisin. */
     fun hasFastLink(peerId: String): Boolean = false
+    /** Octets déjà confiés à ce transport pour ce voisin et pas encore partis (0 = tout est parti). */
+    fun backlog(peerId: String): Int = 0
 }
 
 object Modes {

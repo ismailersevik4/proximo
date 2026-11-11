@@ -7,6 +7,8 @@ on:
     paths: ["app/**", "build.gradle.kts", "settings.gradle.kts", "gradle.properties", ".github/workflows/apk.yml", "signing/**"]
   workflow_dispatch:
 permissions: { contents: write }
+# Une seule publication à la fois : deux envois rapprochés ne se marchent plus dessus.
+concurrency: { group: apk-release, cancel-in-progress: false }
 jobs:
   apk:
     runs-on: ubuntu-latest

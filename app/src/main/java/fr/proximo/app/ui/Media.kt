@@ -46,8 +46,15 @@ object Videos {
     /** Rend (données, secondes) ou null (trop lourde / illisible), avec le message d'erreur. */
     fun load(ctx: Context, uri: Uri): Pair<Pair<ByteArray, Int>?, String?> {
         return try {
-            val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null to "Vidéo illisible"
-            if (bytes.size > MAX_BYTES) return null to "Vidéo trop lourde (${bytes.size / 1_000_000} Mo, maximum 3,5 Mo) : filme-la depuis Proximo, 15 s en basse qualité"
+            fun tooBig(size: Long) = "Vidéo trop lourde (%.1f Mo, maximum 3,5 Mo) : filme-la depuis Proximo, 15 s en basse qualité".format(java.util.Locale.FRANCE, size / 1e6)
+            // La taille est contrôlée AVANT de lire le fichier : une vidéo de 300 Mo ne passe plus en mémoire.
+            val known = try { ctx.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L } catch (e: Exception) { -1L }
+            if (known > MAX_BYTES) return null to tooBig(known)
+            val bytes = ctx.contentResolver.openInputStream(uri)?.use { inp ->
+                val bos = java.io.ByteArrayOutputStream(); val buf = ByteArray(65536); var n: Int
+                while (inp.read(buf).also { n = it } > 0) { bos.write(buf, 0, n); if (bos.size() > MAX_BYTES) return null to tooBig(bos.size().toLong()) }
+                bos.toByteArray()
+            } ?: return null to "Vidéo illisible"
             val r = android.media.MediaMetadataRetriever()
             r.setDataSource(ctx, uri)
             val ms = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
@@ -105,19 +112,38 @@ class VoiceRecorder(private val ctx: Context) {
 /** Position actuelle, sans Google Play : dernière position connue, sinon une demande rapide. */
 object Locations {
     @Suppress("MissingPermission")
-    suspend fun current(ctx: Context): Location? {
+    fun allowed(ctx: Context): Boolean =
+        androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+            androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    /**
+     * Position récente (moins de 2 min), sinon une vraie demande au téléphone — sur toutes les versions d'Android —
+     * en attendant au plus maxWaitMs (un SOS ne doit pas rester bloqué à chercher le GPS). À défaut, la dernière connue.
+     */
+    @Suppress("MissingPermission")
+    suspend fun current(ctx: Context, maxWaitMs: Long = 8000): Location? {
+        if (!allowed(ctx)) return null
         val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
         val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
         val last = providers.mapNotNull { try { lm.getLastKnownLocation(it) } catch (e: Exception) { null } }.maxByOrNull { it.time }
         if (last != null && System.currentTimeMillis() - last.time < 120_000) return last
-        if (Build.VERSION.SDK_INT >= 30) {
-            val provider = when { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER; lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER; else -> return last }
-            return try {
-                suspendCancellableCoroutine { cont ->
-                    lm.getCurrentLocation(provider, null, androidx.core.content.ContextCompat.getMainExecutor(ctx)) { loc -> if (cont.isActive) cont.resume(loc ?: last) }
+        val provider = try {
+            when { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER; lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER; else -> return last }
+        } catch (e: Exception) { return last }
+        val fresh = try {
+            kotlinx.coroutines.withTimeoutOrNull(maxWaitMs) {
+                suspendCancellableCoroutine<Location?> { cont ->
+                    val l = object : android.location.LocationListener {
+                        override fun onLocationChanged(loc: Location) { try { lm.removeUpdates(this) } catch (_: Exception) {}; if (cont.isActive) cont.resume(loc) }
+                        override fun onProviderEnabled(p: String) {}
+                        override fun onProviderDisabled(p: String) {}
+                        @Deprecated("Deprecated in Java") override fun onStatusChanged(p: String?, s: Int, e: android.os.Bundle?) {}
+                    }
+                    try { lm.requestLocationUpdates(provider, 0L, 0f, l, android.os.Looper.getMainLooper()) } catch (e: Exception) { if (cont.isActive) cont.resume(null) }
+                    cont.invokeOnCancellation { try { lm.removeUpdates(l) } catch (_: Exception) {} }
                 }
-            } catch (e: Exception) { last }
-        }
-        return last
+            }
+        } catch (e: Exception) { null }
+        return fresh ?: last
     }
 }

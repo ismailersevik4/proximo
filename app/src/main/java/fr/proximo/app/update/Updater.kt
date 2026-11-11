@@ -17,6 +17,7 @@ import fr.proximo.app.mesh.Peer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -43,7 +44,9 @@ data class Transfer(val percent: Int, val label: String, val ble: Boolean)
 class Updater(private val ctx: Context, private val core: MeshCore) {
     private val tag = "ProximoMaj"
     private val settings = Settings.get(ctx)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + kotlinx.coroutines.CoroutineExceptionHandler { _, e -> Log.e(tag, "tâche de fond", e) })
+    /** Arrêt du réseau : la boucle des offres et les transferts en cours s'arrêtent avec lui. */
+    fun stop() { try { scope.cancel() } catch (_: Exception) {} }
 
     val available = MutableStateFlow<UpdateInfo?>(null)
     /** Offre d'un voisin, gardée à côté de l'offre Internet (le bandeau propose les deux). */
@@ -70,6 +73,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     private var receivingFrom: String? = null
     private var receivingBle = false
     @Volatile private var lastPartAt = 0L
+    /** Dernière offre de voisin acceptée (pour reproposer « Installer » après une interruption). */
+    @Volatile private var lastRequested: UpdateInfo? = null
     private var receiveStart = 0L
 
     // Envoi : accusés « got » par voisin
@@ -77,7 +82,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     @Volatile private var sendingTo: String? = null
 
     // ---------------- Internet ----------------
-    fun checkOnline() = scope.launch {
+    /** manual = l'utilisateur a appuyé sur « Vérifier » : on lui dit le résultat, quel qu'il soit. */
+    fun checkOnline(manual: Boolean = false) = scope.launch {
         try {
             val rel = JSONObject(get("https://api.github.com/repos/$REPO/releases/tags/android"))
             val assets = rel.getJSONArray("assets")
@@ -86,12 +92,16 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
                 val a = assets.getJSONObject(i)
                 when (a.getString("name")) { "proximo-apk.json" -> jsonUrl = a.getString("browser_download_url"); "Proximo.apk" -> apkUrl = a.getString("browser_download_url") }
             }
-            if (jsonUrl == null || apkUrl == null) return@launch
+            if (jsonUrl == null || apkUrl == null) { if (manual) fr.proximo.app.mesh.MeshService.instance?.messenger?.event("Vérification impossible pour l'instant"); return@launch }
             val v = JSONObject(get(jsonUrl))
             val code = v.getInt("code")
-            if (code > myCode) available.value = UpdateInfo(code, v.getString("name"), null, null)
             onlineApkUrl = apkUrl
-        } catch (e: Exception) { Log.i(tag, "vérification en ligne impossible : ${e.message}") }
+            if (code > myCode) available.value = UpdateInfo(code, v.getString("name"), null, null)
+            else if (manual) fr.proximo.app.mesh.MeshService.instance?.messenger?.event("Tu as la dernière version")
+        } catch (e: Exception) {
+            Log.i(tag, "vérification en ligne impossible : ${e.message}")
+            if (manual) fr.proximo.app.mesh.MeshService.instance?.messenger?.event("Vérification impossible : pas d'Internet ?")
+        }
     }
     private var onlineApkUrl: String? = null
 
@@ -109,7 +119,10 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
             } }
             progress.value = -1; transfer.value = null
             install(f)
-        } catch (e: Exception) { progress.value = -1; transfer.value = null; message.value = "Téléchargement impossible : ${e.message}" }
+        } catch (e: Exception) {
+            progress.value = -1; transfer.value = null; message.value = "Téléchargement impossible : ${e.message}"
+            checkOnline() // l'offre « Installer » revient (elle avait disparu au clic)
+        }
     }
 
     private fun get(url: String): String {
@@ -167,13 +180,14 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     private fun sameSignature(apk: File): Boolean {
         return try {
             val pm = ctx.packageManager
-            val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+            // Android 9 ne lit la signature d'un fichier APK qu'avec l'ancien drapeau : on demande les deux,
+            // sinon toute mise à jour y était refusée (« pas signée avec la clé de Proximo »).
+            val flags = PackageManager.GET_SIGNATURES or (if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else 0)
+            fun sigs(pi: android.content.pm.PackageInfo) = (if (Build.VERSION.SDK_INT >= 28) pi.signingInfo?.apkContentsSigners else null)?.takeIf { it.isNotEmpty() } ?: pi.signatures
             val info = pm.getPackageArchiveInfo(apk.absolutePath, flags) ?: return false
             if (info.packageName != ctx.packageName) return false
-            val mine = pm.getPackageInfo(ctx.packageName, flags)
-            val a = if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else info.signatures
-            val b = if (Build.VERSION.SDK_INT >= 28) mine.signingInfo?.apkContentsSigners else mine.signatures
-            a != null && b != null && a.isNotEmpty() && a.first().toCharsString() == b.first().toCharsString()
+            val a = sigs(info); val b = sigs(pm.getPackageInfo(ctx.packageName, flags))
+            a != null && b != null && a.isNotEmpty() && b.isNotEmpty() && a.first().toCharsString() == b.first().toCharsString()
         } catch (e: Exception) { Log.w(tag, "signature", e); false }
     }
 
@@ -211,15 +225,18 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     /** L'utilisateur accepte de récupérer la version du voisin. Sans Wi-Fi direct, on demande confirmation pour le Bluetooth. */
     fun requestFromPeer(peerId: String, allowBle: Boolean = false) {
         val wifi = core.hasWifiLink(peerId)
+        peerOffer.value?.let { if (it.fromPeer == peerId) lastRequested = it }
         if (!wifi && !allowBle) { bleConfirm.value = peerOffer.value ?: available.value ?: UpdateInfo(0, "", peerId, core.peer(peerId)?.name); return }
         bleConfirm.value = null
         if (!wifi && !core.connectedPeerIds().contains(peerId)) { message.value = "Ce voisin n'est pas joignable pour l'instant."; return }
-        val have = JSONArray(); if (receivingFrom == peerId && receiving != null) receivedParts.forEach { have.put(it) }
+        val have = JSONArray()
+        synchronized(this) { if (receivingFrom == peerId && receiving != null) receivedParts.forEach { have.put(it) } }
         val j = JSONObject().put("c", "req").put("v", myCode).put("ble", !wifi).put("have", have).toString()
-        core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), j.toByteArray()))
+        // L'état « réception en cours » est posé AVANT la demande : les morceaux ne sont acceptés que de ce voisin, et seulement pendant le transfert.
         receivingBle = !wifi; receivingFrom = peerId
         progress.value = 0; transfer.value = Transfer(0, if (wifi) "Réception par Wi-Fi direct…" else "Réception par Bluetooth (lent)…", !wifi)
         lastPartAt = System.currentTimeMillis(); receiveStart = lastPartAt
+        core.send(Frame(Frame.APK, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), j.toByteArray()))
         scope.launch {
             val timeout = if (wifi) 60_000 else 180_000
             while (progress.value >= 0) {
@@ -227,6 +244,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
                 if (progress.value >= 0 && System.currentTimeMillis() - lastPartAt > timeout) {
                     progress.value = -1; transfer.value = null
                     message.value = if (receivedParts.isEmpty()) "La mise à jour n'arrive pas : le voisin n'est plus joignable." else "Transfert interrompu à ${receivedParts.size * 100 / maxOf(1, receivingTotal)} % : il reprendra là où il en était quand le voisin sera de nouveau à portée (appuie sur Installer)."
+                    // Le bouton « Installer » revient tout de suite (il avait disparu au clic).
+                    if (peerOffer.value == null) lastRequested?.let { if (it.code > myCode) peerOffer.value = it }
                     break
                 }
             }
@@ -310,6 +329,9 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     private fun onPart(j: JSONObject, data: ByteArray, from: String) {
         val code = j.optInt("v"); val idx = j.optInt("i"); val total = j.optInt("n"); val size = j.optInt("s")
         if (code <= myCode) return
+        // Seulement les morceaux du transfert en cours, venant du voisin à qui on l'a demandé : un morceau en retard
+        // ou non demandé ne relance rien et ne peut plus écraser un fichier déjà complet.
+        if (progress.value < 0 || from != receivingFrom) return
         if (total <= 0 || idx < 0 || idx >= total || size <= 0 || size > 200_000_000 || idx.toLong() * PART + data.size > size) return
         lastPartAt = System.currentTimeMillis()
         if (receiving == null || receivingCode != code) {

@@ -67,7 +67,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
     val contacts by dbState(emptyList<Contact>()) { it.contacts() }
     val codes by dbState(emptyList<String>()) { it.pendingCodes() }
     val peers by peersState()
-    var code by remember { mutableStateOf("") }
+    var code by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
     var toDelete by remember { mutableStateOf<Contact?>(null) }
 
     val scan = rememberLauncherForActivityResult(ScanContract()) { r ->
@@ -90,13 +90,13 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(code, { code = it.uppercase() }, modifier = Modifier.weight(1f), singleLine = true, placeholder = { Text("Code PRX-XXXX-XXXX", color = Px.Muted) }, keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Characters))
                     Spacer(Modifier.width(8.dp))
-                    TextButton(onClick = { if (svc?.messenger?.addByCode(code) == true) code = "" else svc?.messenger?.event("Code invalide") }) { Text("Ajouter") }
+                    TextButton(onClick = { if (svc?.messenger?.addByCode(code) == true) code = "" else svc?.messenger?.event("Code invalide : 8 caractères, sans 0, 1, O, I, L ni U") }) { Text("Ajouter") }
                 }
                 Text("Le code s'échange par SMS ou WhatsApp ; l'ajout se fait dès que vous êtes à portée l'un de l'autre.", color = Px.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
                 if (codes.isNotEmpty()) {
                     Spacer(Modifier.height(10.dp))
                     Text("Codes en attente d'un téléphone à portée :", color = Px.Warn, fontSize = 13.sp)
-                    codes.forEach { c -> Row(verticalAlignment = Alignment.CenterVertically) { Text(c, color = Color.White, modifier = Modifier.weight(1f)); IconButton(onClick = { Db.get(ctx).removePendingCode(c) }) { Icon(Icons.Filled.Close, "Retirer", tint = Px.Muted) } } }
+                    codes.forEach { c -> Row(verticalAlignment = Alignment.CenterVertically) { Text(c, color = Color.White, modifier = Modifier.weight(1f)); IconButton(onClick = { Thread { Db.get(ctx).removePendingCode(c) }.start() }) { Icon(Icons.Filled.Close, "Retirer", tint = Px.Muted) } } }
                 }
                 Spacer(Modifier.height(16.dp))
             }
@@ -148,7 +148,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
             onDismissRequest = { toDelete = null }, containerColor = Px.Card,
             title = { Text("Supprimer ${c.name} ?", color = Color.White) },
             text = { Text("Le contact et vos messages seront effacés de ce téléphone.", color = Px.Muted) },
-            confirmButton = { TextButton(onClick = { Db.get(ctx).deleteContact(c.id); toDelete = null }) { Text("Supprimer", color = Px.Danger) } },
+            confirmButton = { TextButton(onClick = { val id = c.id; toDelete = null; Thread { Db.get(ctx).deleteContact(id) }.start() }) { Text("Supprimer", color = Px.Danger) } },
             dismissButton = { TextButton(onClick = { toDelete = null }) { Text("Annuler", color = Px.Muted) } },
         )
     }
@@ -158,8 +158,8 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
 fun NewGroupScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
     val svc by serviceState()
     val contacts by dbState(emptyList<Contact>()) { it.acceptedContacts() }
-    var name by remember { mutableStateOf("") }
-    val selected = remember { mutableStateOf(setOf<String>()) }
+    var name by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
+    val selected = androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(listOf<String>()) }
     Column(Modifier.fillMaxSize().background(Px.Bg)) {
         ScreenHeader("Nouveau groupe", onBack) {
             TextButton(enabled = name.trim().length >= 2 && selected.value.isNotEmpty(), onClick = { val g = svc?.messenger?.createGroup(name, selected.value.toList()); if (g != null) onCreated(g.id) }) { Text("Créer") }

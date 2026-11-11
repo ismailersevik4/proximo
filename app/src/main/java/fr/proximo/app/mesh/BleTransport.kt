@@ -62,6 +62,10 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         var ready = false
         val assembler = Fragmenter.Assembler()
         val queue = ConcurrentLinkedDeque<ByteArray>()
+        /** Octets en attente dans la file (pour que le cœur n'empile pas toute sa file d'attente en mémoire). */
+        val queued = java.util.concurrent.atomic.AtomicInteger(0)
+        fun enqueue(c: ByteArray) { queue.add(c); queued.addAndGet(c.size) }
+        fun clearQueue() { queue.clear(); queued.set(0) }
         @Volatile var writing = false
         var retries = 0
         var lastSeen = System.currentTimeMillis()
@@ -82,21 +86,31 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         running = true
         val a = adapter
         if (a == null || !a.isEnabled) { listener.onStatus(name, false, "Bluetooth éteint"); return }
-        if (Build.VERSION.SDK_INT < 31) {
-            // Avant Android 12, le scan Bluetooth exige que la localisation du téléphone soit activée.
-            val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-            val on = try { lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) || lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER) } catch (e: Exception) { true }
-            if (!on) listener.onStatus(name, false, "Active la localisation du téléphone : Android l'exige pour que le Bluetooth trouve les voisins")
-        }
+        // Avant Android 12, le scan Bluetooth exige que la localisation du téléphone soit activée.
+        val locationOff = locationIsOff()
+        lastLocationOff = locationOff
         try {
             startServer()
             startAdvertising()
             startScan()
-            listener.onStatus(name, true, "Bluetooth actif")
+            // Localisation coupée (avant Android 12) : le scan ne voit personne, on le dit au lieu d'afficher « actif ».
+            // (Si le téléphone ne peut pas s'annoncer, startAdvertising l'a déjà dit : on ne l'écrase pas.)
+            if (adapter?.bluetoothLeAdvertiser != null || locationOff) listener.onStatus(name, true, if (locationOff) LOCATION_HINT else "Bluetooth actif")
             handler.postDelayed(housekeeping, 15_000)
         } catch (e: Exception) {
             Log.e(tag, "start", e); listener.onStatus(name, false, "Bluetooth : ${e.message}")
         }
+    }
+
+    @Volatile private var scanWarned = false
+    private var lastLocationOff = false
+    private fun locationIsOff(): Boolean {
+        if (Build.VERSION.SDK_INT >= 31) return false
+        return try {
+            val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+            val on = lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) || lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
+            !on
+        } catch (e: Exception) { false }
     }
 
     override fun stop() {
@@ -116,14 +130,20 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
     override fun setMode(mode: Int) {
         if (this.mode == mode) return
         this.mode = mode
-        if (running) { try { scanner?.stopScan(scanCb) } catch (_: Exception) {}; startScan() }
+        if (running) {
+            try { scanner?.stopScan(scanCb) } catch (_: Exception) {}; startScan()
+            // L'annonce suit aussi le mode (« Priorité batterie » ne ralentissait que la recherche).
+            try { advertiser?.stopAdvertising(advCb); startAdvertising() } catch (e: Exception) { Log.w(tag, "annonce", e) }
+        }
     }
+
+    override fun backlog(peerId: String): Int = links.values.filter { it.peerId == peerId }.sumOf { it.queued.get() }
 
     override fun connectedPeers(): Set<String> = links.values.filter { it.ready && it.peerId != null }.mapNotNull { it.peerId }.toSet()
 
     override fun send(peerId: String, data: ByteArray): Boolean {
         val link = links.values.firstOrNull { it.peerId == peerId && it.ready } ?: return false
-        for (c in Fragmenter.split(data, link.chunk)) link.queue.add(c)
+        for (c in Fragmenter.split(data, link.chunk)) link.enqueue(c)
         pump(link)
         return true
     }
@@ -142,7 +162,10 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
     }
 
     private val advCb = object : AdvertiseCallback() {
-        override fun onStartFailure(errorCode: Int) { listener.onStatus(name, true, "Annonce Bluetooth refusée (code $errorCode)") }
+        override fun onStartFailure(errorCode: Int) {
+            if (errorCode == ADVERTISE_FAILED_ALREADY_STARTED) return
+            listener.onStatus(name, true, "Annonce Bluetooth refusée (code $errorCode)")
+        }
     }
 
     private fun startScan() {
@@ -156,7 +179,10 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
     private val scanCb = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) { handleAdv(result) }
         override fun onBatchScanResults(results: MutableList<ScanResult>) { results.forEach { handleAdv(it) } }
-        override fun onScanFailed(errorCode: Int) { listener.onStatus(name, true, "Scan Bluetooth en erreur (code $errorCode)") }
+        override fun onScanFailed(errorCode: Int) {
+            if (errorCode == SCAN_FAILED_ALREADY_STARTED) return
+            scanWarned = true; listener.onStatus(name, true, "Scan Bluetooth en erreur (code $errorCode)")
+        }
     }
 
     private fun handleAdv(r: ScanResult) {
@@ -166,6 +192,8 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         if (peerId == myId) return
         val addr = r.device.address
         val now = System.currentTimeMillis()
+        // La recherche remarche : l'avertissement « Scan en erreur » s'en va.
+        if (scanWarned) { scanWarned = false; listener.onStatus(name, true, if (lastLocationOff) LOCATION_HINT else "Bluetooth actif") }
         seenAdv[addr] = now
         idByAddress[addr] = peerId
         links[addr]?.let { it.rssi = r.rssi; it.lastSeen = now; if (it.peerId == null) it.peerId = peerId }
@@ -176,7 +204,8 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
             listener.onPeerSeen(peerId, null, name, r.rssi)
         }
         // Le plus petit identifiant se connecte à l'autre, avec un délai croissant après des échecs.
-        if (myId < peerId && links[addr] == null) {
+        // (L'adresse Bluetooth d'un téléphone change toutes les 15 min environ : on ne rouvre pas une 2e liaison vers un voisin déjà relié.)
+        if (myId < peerId && links[addr] == null && links.values.none { it.peerId == peerId && it.ready }) {
             val f = connectFailures[addr]
             val wait = when (f?.first ?: 0) { 0 -> 0L; 1 -> 10_000L; 2 -> 30_000L; else -> 60_000L }
             if (f == null || now - f.second > wait) connectTo(r.device, peerId)
@@ -243,12 +272,12 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
     /** Battement de cœur : permet de voir en 30 s qu'un voisin s'est endormi (Samsung…) au lieu d'attendre 90 s. */
     private fun sendPing(link: Link, pong: Boolean) {
         val f = Frame(Frame.PING, 0, 0, 0, Frame.newId(), Hex.dec(myId), Frame.BROADCAST, byteArrayOf(if (pong) 1 else 0))
-        link.queue.add(f.encode()); pump(link)
+        link.enqueue(f.encode()); pump(link)
     }
 
     private fun sendHello(link: Link) {
         val f = Frame(Frame.HELLO, 0, 0, 0, Frame.newId(), Hex.dec(myId), Frame.BROADCAST, myName().toByteArray())
-        for (c in Fragmenter.split(f.encode(), link.chunk)) link.queue.add(c)
+        for (c in Fragmenter.split(f.encode(), link.chunk)) link.enqueue(c)
         pump(link)
     }
 
@@ -257,8 +286,10 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         if (!link.ready && link.gatt != null) { val f = connectFailures[link.address]; connectFailures[link.address] = ((f?.first ?: 0) + 1) to System.currentTimeMillis() }
         if (link.ready) connectFailures.remove(link.address)
         try { link.gatt?.disconnect(); link.gatt?.close() } catch (_: Exception) {}
-        val pending = link.queue.isNotEmpty()
-        link.queue.clear()
+        // Côté serveur aussi, on coupe vraiment la connexion (sinon elle reste ouverte chez Android sans servir).
+        if (link.gatt == null) link.serverDevice?.let { try { server?.cancelConnection(it) } catch (_: Exception) {} }
+        val pending = link.queue.isNotEmpty() || link.writing
+        link.clearQueue()
         link.peerId?.let { id ->
             if (pending) MeshService.instance?.core?.onDeliveryFailed(id)
             if (links.values.none { it.peerId == id && it.ready }) listener.onPeerLost(id, name)
@@ -305,11 +336,14 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
 
     // ---------------- envoi / réception ----------------
     private fun pump(link: Link) {
-        if (links[link.address] !== link) { link.queue.clear(); return }
+        if (links[link.address] !== link) { link.clearQueue(); return }
         val chunk: ByteArray
         synchronized(link) {
             if (link.writing) return
-            chunk = link.queue.peek() ?: return
+            // Le morceau est retiré de la file AVANT l'écriture : le rappel « écrit » d'Android peut arriver sur un autre fil
+            // avant la fin de cette fonction, et il ne doit jamais retrouver le même morceau en tête (envoi en double, puis morceau suivant perdu).
+            chunk = link.queue.poll() ?: return
+            link.queued.addAndGet(-chunk.size)
             link.writing = true
         }
         var ok = false
@@ -325,13 +359,14 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
                 val dev = link.serverDevice; val tx = txChar; val s = server
                 if (dev != null && tx != null && s != null) {
                     ok = if (Build.VERSION.SDK_INT >= 33) s.notifyCharacteristicChanged(dev, tx, false, chunk) == BluetoothGatt.GATT_SUCCESS
-                    else { tx.value = chunk; s.notifyCharacteristicChanged(dev, tx, false) }
+                    else synchronized(txLock) { tx.value = chunk; s.notifyCharacteristicChanged(dev, tx, false) } // avant Android 13, la valeur est commune à tous les clients
                 }
             }
         } catch (e: Exception) { Log.w(tag, "écriture", e) }
-        if (ok) { synchronized(link) { link.queue.poll() }; link.retries = 0 } // le morceau est parti ; sinon il reste en tête et sera retenté
+        if (ok) link.retries = 0 // le morceau est parti
         else {
-            synchronized(link) { link.writing = false }
+            // Refusé : il retourne en tête de file et sera retenté.
+            synchronized(link) { link.queue.addFirst(chunk); link.queued.addAndGet(chunk.size); link.writing = false }
             if (++link.retries > 200) { Log.w(tag, "écritures refusées en série : liaison coupée"); dropLink(link) }
             else handler.postDelayed({ pump(link) }, 50)
         }
@@ -361,6 +396,7 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         listener.onFrame(full, pid, name)
     }
 
+    private val txLock = Any()
     private var ticks = 0
     private val housekeeping = object : Runnable {
         override fun run() {
@@ -374,7 +410,14 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
                 val adv = seenAdv[l.address] ?: l.lastSeen
                 if (now - maxOf(adv, l.lastSeen) > 90_000) dropLink(l)
             }
-            for ((addr, t) in seenAdv.entries.toList()) if (now - t > 90_000) { seenAdv.remove(addr); idByAddress[addr]?.let { id -> if (links.values.none { it.peerId == id }) listener.onPeerLost(id, name) } }
+            for ((addr, t) in seenAdv.entries.toList()) if (now - t > 90_000) {
+                seenAdv.remove(addr); idByAddress[addr]?.let { id -> if (links.values.none { it.peerId == id }) listener.onPeerLost(id, name) }
+                // Les adresses Bluetooth changent sans cesse : on oublie les anciennes au lieu de les garder pour toujours.
+                if (links[addr] == null) { idByAddress.remove(addr); lastNotified.remove(addr); connectFailures.remove(addr) }
+            }
+            // La localisation a été allumée ou éteinte entre-temps : l'avertissement suit.
+            val off = locationIsOff()
+            if (off != lastLocationOff) { lastLocationOff = off; listener.onStatus(name, true, if (off) LOCATION_HINT else "Bluetooth actif") }
             // Sur certains téléphones le scan s'arrête tout seul : on le relance de temps en temps (toutes les 30 s).
             if (++ticks % 2 == 0) { try { scanner?.stopScan(scanCb) } catch (_: Exception) {}; startScan() }
             handler.postDelayed(this, 15_000)
@@ -387,5 +430,6 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         val TX: UUID = UUID.fromString("7a1b0003-9b3e-4c2a-8f1d-70726f780001")
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         const val MAX_LINKS = 7
+        const val LOCATION_HINT = "Active la localisation du téléphone : Android l'exige pour que le Bluetooth trouve les voisins"
     }
 }

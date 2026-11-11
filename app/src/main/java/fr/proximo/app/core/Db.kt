@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -27,6 +28,8 @@ data class Message(
 ) {
     /** Arrivé plus d'une heure après avoir été écrit : à signaler. */
     val late: Boolean get() = !mine && received > 0 && received - time > 3600_000L
+    /** Heure qui range le message dans la discussion : son arrivée sur ce téléphone (ou son envoi, pour les miens). */
+    val shownAt: Long get() = if (received > 0) received else time
     companion object {
         const val PENDING = 0; const val RELAYED = 1; const val DELIVERED = 2; const val FAILED = 3
         const val TEXT = "text"; const val PHOTO = "photo"; const val VOICE = "voice"; const val VIDEO = "video"; const val LOC = "loc"; const val SOS = "sos"; const val SYS = "sys"; const val WIZZ = "wizz"
@@ -36,15 +39,17 @@ data class Message(
 data class ChatSummary(val chat: String, val name: String, val last: Message?, val unread: Int, val isGroup: Boolean)
 
 /** Trame rangée en attente (pas encore remise ou à relayer plus tard). */
-data class Outbox(val fid: String, val data: ByteArray, val dest: String, val created: Long, val sentTo: MutableSet<String>, val mine: Boolean)
+data class Outbox(val fid: String, val data: ByteArray, val dest: String, val created: Long, val sentTo: MutableSet<String>, val mine: Boolean,
+    /** Taille du contenu sur le disque (la liste de la file ne charge pas le contenu : voir Db.outboxData). */
+    val size: Long = data.size.toLong())
 
-class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 4) {
+class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 5) {
     /** Les gros contenus (file d'attente, trames mises de côté) sont en fichiers : SQLite refuse les lignes de plus de 2 Mo. */
     private val outboxDir = java.io.File(ctx.filesDir, "outbox").also { it.mkdirs() }
     private val heldDir = java.io.File(ctx.filesDir, "held").also { it.mkdirs() }
     /** Compteur qui change à chaque écriture : l'interface se rafraîchit en l'observant. */
     val changes = MutableStateFlow(0L)
-    private fun bump() { changes.value = changes.value + 1 }
+    private fun bump() { changes.update { it + 1 } }
 
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE contacts(id TEXT PRIMARY KEY, name TEXT, dh BLOB, sg BLOB, status INTEGER, added INTEGER, last_seen INTEGER)")
@@ -56,11 +61,22 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         db.execSQL("CREATE TABLE outbox(fid TEXT PRIMARY KEY, data BLOB, dest TEXT, created INTEGER, sent_to TEXT, mine INTEGER)")
         db.execSQL("CREATE TABLE held(fid TEXT PRIMARY KEY, from_id TEXT, peer TEXT, t INTEGER)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
+        db.execSQL("CREATE TABLE acked(fid TEXT PRIMARY KEY, t INTEGER)")
+        db.execSQL("CREATE INDEX idx_msg_unread ON messages(chat) WHERE read=0 AND mine=0")
+        db.execSQL("CREATE INDEX idx_msg_arrival ON messages(chat, $ARRIVAL)")
     }
     override fun onUpgrade(db: SQLiteDatabase, o: Int, n: Int) {
         if (o < 2) db.execSQL("ALTER TABLE messages ADD COLUMN sender_name TEXT DEFAULT ''")
         if (o < 3) { db.execSQL("CREATE TABLE IF NOT EXISTS held(fid TEXT PRIMARY KEY, from_id TEXT, peer TEXT, t INTEGER)"); db.execSQL("DELETE FROM outbox") }
         if (o < 4) db.execSQL("ALTER TABLE messages ADD COLUMN received INTEGER DEFAULT 0")
+        if (o < 5) {
+            // Accusés déjà envoyés (pour les renvoyer si l'expéditeur ne les a pas eus), index des non-lus,
+            // et retrait des invitations de groupe qui s'affichaient comme des messages.
+            db.execSQL("CREATE TABLE IF NOT EXISTS acked(fid TEXT PRIMARY KEY, t INTEGER)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_msg_unread ON messages(chat) WHERE read=0 AND mine=0")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_msg_arrival ON messages(chat, $ARRIVAL)")
+            db.execSQL("DELETE FROM messages WHERE kind='ginv'")
+        }
     }
 
     // ---------- contacts ----------
@@ -86,7 +102,12 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     fun touchContact(id: String) { writableDatabase.execSQL("UPDATE contacts SET last_seen=? WHERE id=?", arrayOf(System.currentTimeMillis(), id)) }
     fun renameContact(id: String, name: String) { writableDatabase.execSQL("UPDATE contacts SET name=? WHERE id=?", arrayOf(name, id)); bump() }
     fun deleteContact(id: String) {
+        deleteFilesOf(id)
         writableDatabase.delete("contacts", "id=?", arrayOf(id)); writableDatabase.delete("messages", "chat=?", arrayOf(id)); bump()
+    }
+    /** Photos, vocaux et vidéos d'une discussion qu'on supprime. */
+    private fun deleteFilesOf(chat: String) {
+        for (f in q("SELECT file FROM messages WHERE chat=? AND file IS NOT NULL", chat) { it.getString(0) }) try { java.io.File(f).delete() } catch (_: Exception) {}
     }
 
     fun addPendingCode(code: String) { writableDatabase.execSQL("INSERT OR REPLACE INTO pending_codes VALUES(?,?)", arrayOf(code, System.currentTimeMillis())); bump() }
@@ -106,11 +127,11 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         }
         writableDatabase.insertWithOnConflict("groups", null, cv, SQLiteDatabase.CONFLICT_REPLACE); bump()
     }
-    fun deleteGroup(id: String) { writableDatabase.delete("groups", "id=?", arrayOf(id)); writableDatabase.delete("messages", "chat=?", arrayOf(id)); bump() }
+    fun deleteGroup(id: String) { deleteFilesOf(id); writableDatabase.delete("groups", "id=?", arrayOf(id)); writableDatabase.delete("messages", "chat=?", arrayOf(id)); bump() }
 
     // ---------- messages ----------
     fun messages(chat: String, limit: Int = 500): List<Message> =
-        q("SELECT * FROM messages WHERE chat=? ORDER BY time DESC LIMIT $limit", chat) { readMsg(it) }.asReversed()
+        q("SELECT * FROM messages WHERE chat=? ORDER BY $ARRIVAL DESC LIMIT $limit", chat) { readMsg(it) }.asReversed()
     fun message(mid: String): Message? = q("SELECT * FROM messages WHERE mid=?", mid) { readMsg(it) }.firstOrNull()
     private fun readMsg(c: Cursor) = Message(c.getString(0), c.getString(1), c.getString(2), c.getInt(3) == 1, c.getString(4), c.getString(5), c.getString(6), c.getLong(7), c.getInt(8), c.getInt(9) == 1, c.getString(10) ?: "", c.getString(11) ?: "", c.getLong(12))
 
@@ -122,13 +143,18 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         writableDatabase.insertWithOnConflict("messages", null, cv, SQLiteDatabase.CONFLICT_REPLACE); bump()
     }
     fun setStatus(mid: String, status: Int, route: String? = null) {
-        if (route != null) writableDatabase.execSQL("UPDATE messages SET status=MAX(status,?), route=? WHERE mid=?", arrayOf(status, route, mid))
-        else writableDatabase.execSQL("UPDATE messages SET status=MAX(status,?) WHERE mid=?", arrayOf(status, mid))
+        // « Reçu » l'emporte toujours, même sur un ancien « Échec » (accusé arrivé très tard).
+        val expr = if (status == Message.DELIVERED) "?" else "MAX(status,?)"
+        if (route != null) writableDatabase.execSQL("UPDATE messages SET status=$expr, route=? WHERE mid=?", arrayOf(status, route, mid))
+        else writableDatabase.execSQL("UPDATE messages SET status=$expr WHERE mid=?", arrayOf(status, mid))
         bump()
     }
     /** Un message jamais parti (personne à portée) : « Échec », sans toucher à ceux déjà relayés ou reçus. */
     fun failIfPending(mid: String) { writableDatabase.execSQL("UPDATE messages SET status=? WHERE mid=? AND status=?", arrayOf(Message.FAILED, mid, Message.PENDING)); bump() }
-    fun markRead(chat: String) { writableDatabase.execSQL("UPDATE messages SET read=1 WHERE chat=? AND read=0", arrayOf(chat)); bump() }
+    fun markRead(chat: String) {
+        val n = writableDatabase.update("messages", ContentValues().apply { put("read", 1) }, "chat=? AND read=0", arrayOf(chat))
+        if (n > 0) bump() // rien à marquer : on ne fait pas relire tous les écrans pour rien
+    }
     fun unreadTotal(): Int = q("SELECT COUNT(*) FROM messages WHERE read=0 AND mine=0") { it.getInt(0) }.firstOrNull() ?: 0
     fun deleteMessage(mid: String) {
         message(mid)?.file?.let { java.io.File(it).delete() }
@@ -142,14 +168,19 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     fun chatSummaries(): List<ChatSummary> {
         val out = ArrayList<ChatSummary>()
         fun add(chat: String, name: String, isGroup: Boolean) {
-            val last = q("SELECT * FROM messages WHERE chat=? ORDER BY time DESC LIMIT 1", chat) { readMsg(it) }.firstOrNull()
+            val last = q("SELECT * FROM messages WHERE chat=? ORDER BY $ARRIVAL DESC LIMIT 1", chat) { readMsg(it) }.firstOrNull()
             val unread = q("SELECT COUNT(*) FROM messages WHERE chat=? AND read=0 AND mine=0", chat) { it.getInt(0) }.firstOrNull() ?: 0
             out.add(ChatSummary(chat, name, last, unread, isGroup))
         }
         add(ALL, "Tout le monde", true)
         groups().forEach { add(it.id, it.name, true) }
         contacts().filter { it.status != 0 }.forEach { add(it.id, it.name, false) }
-        return out.sortedWith(compareByDescending<ChatSummary> { it.chat == ALL }.thenByDescending { it.last?.time ?: 0L })
+        // Discussions qui ont des messages reçus mais ne sont ni un groupe ni un contact (messages privés d'inconnus) :
+        // sans cette ligne, elles restaient introuvables et le compteur de non-lus ne redescendait jamais.
+        val known = out.map { it.chat }.toSet()
+        q("SELECT chat, MAX(sender_name) FROM messages WHERE mine=0 GROUP BY chat") { it.getString(0) to (it.getString(1) ?: "") }
+            .filter { it.first !in known }.forEach { (c, n) -> add(c, n.ifBlank { "Inconnu" }, false) }
+        return out.sortedWith(compareByDescending<ChatSummary> { it.chat == ALL }.thenByDescending { it.last?.shownAt ?: 0L })
     }
 
     // ---------- dédoublonnage ----------
@@ -159,16 +190,31 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     }
     fun purgeOld() {
         val d = System.currentTimeMillis() - 30L * 24 * 3600 * 1000
-        writableDatabase.delete("seen", "t<?", arrayOf((System.currentTimeMillis() - 40L * 24 * 3600 * 1000).toString()))
+        val old = (System.currentTimeMillis() - 40L * 24 * 3600 * 1000).toString()
+        writableDatabase.delete("seen", "t<?", arrayOf(old))
+        writableDatabase.delete("acked", "t<?", arrayOf(old))
+        var changed = false
         // Mes messages jamais remis après 30 jours : marqués « Échec » (ils ne repartiront plus).
         for (fid in q("SELECT fid FROM outbox WHERE created<? AND mine=1", d.toString()) { it.getString(0) }) {
-            writableDatabase.execSQL("UPDATE messages SET status=? WHERE mid=? AND status=?", arrayOf(Message.FAILED, fid, Message.PENDING))
+            val n = writableDatabase.update("messages", ContentValues().apply { put("status", Message.FAILED) }, "mid=? AND status=?", arrayOf(fid, Message.PENDING.toString()))
+            if (n > 0) changed = true
         }
         for (fid in q("SELECT fid FROM outbox WHERE created<?", d.toString()) { it.getString(0) }) removeOutbox(fid)
         val h = System.currentTimeMillis() - 7L * 24 * 3600 * 1000
         for (fid in q("SELECT fid FROM held WHERE t<?", h.toString()) { it.getString(0) }) removeHeld(fid)
+        capHeld()
         capOutbox()
-        bump()
+        if (changed) bump() // l'interface ne se rafraîchit que si un statut a vraiment changé
+    }
+
+    /** Les trames mises de côté ne comptaient dans aucun plafond : au-delà de 30 Mo, les plus anciennes partent. */
+    private fun capHeld() {
+        var total = (heldDir.listFiles() ?: return).sumOf { it.length() }
+        if (total <= HELD_CAP) return
+        for (fid in q("SELECT fid FROM held ORDER BY t") { it.getString(0) }) {
+            if (total <= HELD_CAP) break
+            total -= java.io.File(heldDir, "$fid.bin").length(); removeHeld(fid)
+        }
     }
 
     /** Plafond de stockage des relais (300 Mo) : on efface d'abord ce qui n'est pas à moi, le plus lourd et le plus vieux. */
@@ -182,26 +228,43 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     }
 
     // ---------- file d'attente (contenu en fichiers) ----------
+    /**
+     * La file d'attente SANS le contenu des trames (seulement leur taille) : on la relit très souvent, et charger
+     * des dizaines de Mo de photos et vidéos à chaque passage finissait par saturer la mémoire. Le contenu se lit
+     * au moment d'envoyer, avec [outboxData].
+     */
     fun outbox(): List<Outbox> {
-        val rows = q("SELECT fid, dest, created, sent_to, mine FROM outbox ORDER BY created DESC") {
-            val set = HashSet<String>(); val arr = JSONArray(it.getString(3)); for (i in 0 until arr.length()) set.add(arr.getString(i))
-            Outbox(it.getString(0), ByteArray(0), it.getString(1), it.getLong(2), set, it.getInt(4) == 1)
-        }
+        val rows = q("SELECT fid, dest, created, sent_to, mine FROM outbox ORDER BY created DESC") { readOutboxRow(it) }
         val out = ArrayList<Outbox>(rows.size)
         for (r in rows) {
             val f = java.io.File(outboxDir, r.fid + ".bin")
             if (!f.exists()) { writableDatabase.delete("outbox", "fid=?", arrayOf(r.fid)); continue }
-            out.add(Outbox(r.fid, f.readBytes(), r.dest, r.created, r.sentTo, r.mine))
+            out.add(r.copy(size = f.length()))
         }
         return out
     }
+    private fun readOutboxRow(c: Cursor): Outbox {
+        val set = HashSet<String>(); val arr = JSONArray(c.getString(3)); for (i in 0 until arr.length()) set.add(arr.getString(i))
+        return Outbox(c.getString(0), ByteArray(0), c.getString(1), c.getLong(2), set, c.getInt(4) == 1)
+    }
+    /** Une ligne de la file (sans contenu), ou null. */
+    fun outboxRow(fid: String): Outbox? = q("SELECT fid, dest, created, sent_to, mine FROM outbox WHERE fid=?", fid) { readOutboxRow(it) }.firstOrNull()
+    /** Le contenu d'une trame en attente, lu au moment de l'envoyer. */
+    fun outboxData(fid: String): ByteArray? = try { java.io.File(outboxDir, "$fid.bin").takeIf { it.exists() }?.readBytes() } catch (e: Exception) { null }
     fun outboxCount(): Int = q("SELECT COUNT(*) FROM outbox") { it.getInt(0) }.firstOrNull() ?: 0
-    /** (mes messages en attente, trames en transit pour d'autres). Les trames techniques (accusés, contacts) ne comptent pas. */
+    /**
+     * (mes messages privés en attente de « Reçu », trames en transit pour d'autres).
+     * Les messages de « Tout le monde » et de groupe n'ont jamais d'accusé : ils ne comptent pas comme « en attente de Reçu ».
+     */
     fun outboxDetail(): Pair<Int, Int> {
-        val mine = q("SELECT COUNT(*) FROM outbox WHERE mine=1") { it.getInt(0) }.firstOrNull() ?: 0
+        val mine = q("SELECT COUNT(*) FROM messages WHERE mine=1 AND status<2 AND kind!='sys' AND chat!='$ALL' AND chat NOT IN (SELECT id FROM groups) AND mid IN (SELECT fid FROM outbox)") { it.getInt(0) }.firstOrNull() ?: 0
         val others = q("SELECT COUNT(*) FROM outbox WHERE mine=0") { it.getInt(0) }.firstOrNull() ?: 0
         return mine to others
     }
+
+    // ---------- accusés déjà envoyés ----------
+    fun markAcked(fid: String) { writableDatabase.execSQL("INSERT OR IGNORE INTO acked VALUES(?,?)", arrayOf(fid, System.currentTimeMillis())) }
+    fun acked(fid: String): Boolean = q("SELECT 1 FROM acked WHERE fid=?", fid) { 1 }.isNotEmpty()
     fun saveOutbox(o: Outbox) {
         java.io.File(outboxDir, o.fid + ".bin").writeBytes(o.data)
         val cv = ContentValues().apply {
@@ -213,15 +276,17 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     fun removeOutbox(fid: String) { writableDatabase.delete("outbox", "fid=?", arrayOf(fid)); java.io.File(outboxDir, "$fid.bin").delete() }
 
     // ---------- trames mises de côté (clé du contact pas encore reçue) ----------
-    fun saveHeld(fid: String, data: ByteArray, from: String, peer: String) {
+    /** t = date de la première mise de côté : un rejeu ne remet pas le délai de 7 jours à zéro. */
+    fun saveHeld(fid: String, data: ByteArray, from: String, peer: String, t: Long = System.currentTimeMillis()) {
         java.io.File(heldDir, "$fid.bin").writeBytes(data)
-        writableDatabase.execSQL("INSERT OR REPLACE INTO held VALUES(?,?,?,?)", arrayOf(fid, from, peer, System.currentTimeMillis()))
+        writableDatabase.execSQL("INSERT OR REPLACE INTO held VALUES(?,?,?,?)", arrayOf(fid, from, peer, t))
     }
-    /** (données, voisin qui l'a remise) pour les trames de cet expéditeur (null = toutes). */
-    fun held(from: String?): List<Triple<String, ByteArray, String>> {
-        val rows = if (from == null) q("SELECT fid, peer FROM held ORDER BY t") { it.getString(0) to it.getString(1) } else q("SELECT fid, peer FROM held WHERE from_id=? ORDER BY t", from) { it.getString(0) to it.getString(1) }
-        return rows.mapNotNull { (fid, peer) -> val f = java.io.File(heldDir, "$fid.bin"); if (f.exists()) Triple(fid, f.readBytes(), peer) else { removeHeld(fid); null } }
-    }
+    /** (identifiant, voisin qui l'a remise, date) des trames de cet expéditeur (null = toutes), sans leur contenu. */
+    fun heldIds(from: String?): List<Triple<String, String, Long>> =
+        if (from == null) q("SELECT fid, peer, t FROM held ORDER BY t") { Triple(it.getString(0), it.getString(1), it.getLong(2)) }
+        else q("SELECT fid, peer, t FROM held WHERE from_id=? ORDER BY t", from) { Triple(it.getString(0), it.getString(1), it.getLong(2)) }
+    fun heldData(fid: String): ByteArray? = try { java.io.File(heldDir, "$fid.bin").takeIf { it.exists() }?.readBytes() } catch (e: Exception) { null }
+    fun isHeld(fid: String): Boolean = q("SELECT 1 FROM held WHERE fid=?", fid) { 1 }.isNotEmpty()
     fun removeHeld(fid: String) { writableDatabase.delete("held", "fid=?", arrayOf(fid)); java.io.File(heldDir, "$fid.bin").delete() }
 
     // ---------- réglages divers ----------
@@ -237,6 +302,9 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     companion object {
         const val ALL = "all"
         const val OUTBOX_CAP = 300L * 1024 * 1024
+        const val HELD_CAP = 30L * 1024 * 1024
+        /** Tri des discussions par heure d'arrivée sur ce téléphone : un message arrivé en retard se range en bas, là où on le voit. */
+        private const val ARRIVAL = "CASE WHEN received>0 THEN received ELSE time END"
         @Volatile private var inst: Db? = null
         fun get(ctx: Context): Db = inst ?: synchronized(this) { inst ?: Db(ctx.applicationContext).also { inst = it } }
         fun jsonObj(s: String): JSONObject = try { JSONObject(s) } catch (e: Exception) { JSONObject() }

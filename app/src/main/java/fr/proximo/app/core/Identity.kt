@@ -100,9 +100,10 @@ class Identity private constructor(ctx: Context) {
             return "PRX-" + sb.substring(0, 4) + "-" + sb.substring(4, 8)
         }
         fun normalizeCode(s: String): String {
-            val up = s.uppercase().replace("O", "0").replace("I", "1").replace("L", "1").filter { it.isLetterOrDigit() }
+            val up = s.uppercase().filter { it.isLetterOrDigit() }
             val body = if (up.startsWith("PRX")) up.substring(3) else up
-            return if (body.length == 8) "PRX-" + body.substring(0, 4) + "-" + body.substring(4) else ""
+            // Les codes n'utilisent ni 0, 1, O, I, L ni U : un code qui en contient ne peut correspondre à aucun téléphone.
+            return if (body.length == 8 && body.all { it in ALPHA }) "PRX-" + body.substring(0, 4) + "-" + body.substring(4) else ""
         }
         fun signedBytes(id: String, name: String, dhPub: ByteArray, sigPub: ByteArray, t: Long): ByteArray =
             (id + "|" + name + "|" + t + "|").toByteArray() + dhPub + sigPub

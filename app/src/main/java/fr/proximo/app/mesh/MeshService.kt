@@ -40,7 +40,8 @@ class MeshService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannels(this)
-        goForeground(NOTIF_ID, serviceNotification())
+        // Android peut refuser le premier plan (relance en arrière-plan sans exemption batterie) : on s'arrête proprement au lieu de planter.
+        try { goForeground(NOTIF_ID, serviceNotification()) } catch (e: Exception) { android.util.Log.w("Proximo", "premier plan refusé", e); stopSelf(); return }
         val me = Identity.get(this)
         val transports = ArrayList<Transport>()
         val holder = object : TransportListener {
@@ -110,9 +111,12 @@ class MeshService : Service() {
         scope.cancel()
         try { wakeLock?.release() } catch (_: Exception) {}
         try { unregisterReceiver(radioReceiver) } catch (_: Exception) {}
-        try { core.stop() } catch (_: Exception) {}
-        calls.hangup()
-        running.value = null
+        // Raccrocher AVANT d'arrêter le réseau, sinon le « raccroché » ne part jamais et l'autre reste en ligne.
+        if (::calls.isInitialized) try { calls.hangup() } catch (_: Exception) {}
+        if (::messenger.isInitialized) messenger.stop()
+        if (::updater.isInitialized) updater.stop()
+        if (::core.isInitialized) try { core.stop() } catch (_: Exception) {}
+        if (running.value === this) running.value = null
         super.onDestroy()
     }
 
@@ -139,7 +143,24 @@ class MeshService : Service() {
     }
 
     private fun goForeground(id: Int, n: Notification) {
-        if (Build.VERSION.SDK_INT >= 29) startForeground(id, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE) else startForeground(id, n)
+        if (Build.VERSION.SDK_INT < 29) { startForeground(id, n); return }
+        // Android 10 et 11 : sans le type « localisation », la recherche Bluetooth ne remonte plus rien écran éteint.
+        if (Build.VERSION.SDK_INT <= 30) {
+            try { startForeground(id, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION); return }
+            catch (e: Exception) { android.util.Log.w("Proximo", "type localisation refusé", e) }
+        }
+        startForeground(id, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+    }
+
+    /** Pendant un appel, le service déclare le micro : sans ça, Android coupe le micro dès que l'écran s'éteint (Android 11+). */
+    fun setCallActive(on: Boolean) {
+        if (Build.VERSION.SDK_INT < 30) return
+        val micOk = ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+            (if (on && micOk) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0) or
+            (if (Build.VERSION.SDK_INT == 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0)
+        try { startForeground(NOTIF_ID, serviceNotification(core.peers.value.size, core.pendingDetail.value.first), type) }
+        catch (e: Exception) { android.util.Log.w("Proximo", "type micro refusé", e) }
     }
 
     companion object {

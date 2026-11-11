@@ -41,7 +41,7 @@ class Frame(
     }
 
     /** Copie pour relais : un saut de plus, un ttl de moins. */
-    fun forwarded(): Frame = Frame(type, ttl - 1, hops + 1, flags, fid, from, to, payload)
+    fun forwarded(): Frame = Frame(type, minOf(ttl, DEFAULT_TTL) - 1, hops + 1, flags, fid, from, to, payload)
 
     companion object {
         const val VERSION = 1
@@ -107,6 +107,7 @@ class Frame(
  */
 object Fragmenter {
     const val HDR = 1 + 16 + 2 + 2
+    private const val MAX_PARTIALS = 16
 
     fun split(frame: ByteArray, maxChunk: Int): List<ByteArray> {
         if (frame.size <= maxChunk) return listOf(frame)
@@ -125,9 +126,10 @@ object Fragmenter {
         return out
     }
 
+    /** Les morceaux sont gardés au fur et à mesure : rien n'est réservé d'avance sur la seule foi du total annoncé. */
     private class Partial(val total: Int) {
-        val parts = arrayOfNulls<ByteArray>(total)
-        var got = 0
+        val parts = HashMap<Int, ByteArray>()
+        var bytes = 0
         var last = System.currentTimeMillis()
     }
 
@@ -148,15 +150,21 @@ object Fragmenter {
             val total = b.short.toInt() and 0xffff
             if (total == 0 || idx >= total) return null
             val key = Hex.enc(fid)
+            // Pas plus de 16 trames en cours de recollage par liaison (un voisin n'en envoie qu'une ou deux à la fois).
+            if (!partials.containsKey(key) && partials.size >= MAX_PARTIALS) { cleanup(); if (partials.size >= MAX_PARTIALS) return null }
             val p = partials.getOrPut(key) { Partial(total) }
             if (p.total != total) { partials.remove(key); return null }
-            if (p.parts[idx] == null) { p.parts[idx] = chunk.copyOfRange(HDR, chunk.size); p.got++ }
+            if (!p.parts.containsKey(idx)) {
+                p.bytes += chunk.size - HDR
+                // Plus gros que la plus grande trame possible : on abandonne ce recollage.
+                if (p.bytes > Frame.HEADER + Frame.MAX_PAYLOAD) { partials.remove(key); return null }
+                p.parts[idx] = chunk.copyOfRange(HDR, chunk.size)
+            }
             p.last = System.currentTimeMillis()
-            if (p.got < total) { cleanup(); return null }
+            if (p.parts.size < total) { cleanup(); return null }
             partials.remove(key)
-            var size = 0; for (x in p.parts) size += x!!.size
-            val out = ByteArray(size); var pos = 0
-            for (x in p.parts) { System.arraycopy(x!!, 0, out, pos, x.size); pos += x.size }
+            val out = ByteArray(p.bytes); var pos = 0
+            for (i in 0 until total) { val x = p.parts[i] ?: return null; System.arraycopy(x, 0, out, pos, x.size); pos += x.size }
             return out
         }
 
