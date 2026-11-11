@@ -77,7 +77,32 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     /** Un appel est possible en direct (prise Wi-Fi) ou peut-être via un voisin (il faut au moins une prise Wi-Fi). */
     fun canCall(peerId: String): Boolean = contactKey(peerId) != null && (core.hasWifiLink(peerId) || core.wifiLinkedPeers().isNotEmpty())
 
-    private fun contactKey(peerId: String): ByteArray? = db.contact(peerId)?.dhPub ?: MeshService.instance?.messenger?.cards?.get(peerId)?.dhPub
+    private fun contactKey(peerId: String): ByteArray? = db.contact(peerId)?.dhPub?.takeIf { it.size == 32 } ?: MeshService.instance?.messenger?.cards?.get(peerId)?.dhPub
+    private fun contactSigKey(peerId: String): ByteArray? = db.contact(peerId)?.sigPub?.takeIf { it.size == 32 } ?: MeshService.instance?.messenger?.cards?.get(peerId)?.sigPub
+
+    // ---- signalisation signée ----
+    /** Identifiant de l'appel en cours : l'aléa de l'appelant (le mien si j'appelle, le sien si on m'appelle). */
+    private fun callId(): ByteArray = if (sendDir == 1.toByte()) mySalt else peerSalt
+    /** Invitations déjà vues : une invitation rejouée ne fait pas sonner une deuxième fois. */
+    private val seenInvites = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    private fun callSigned(c: String, fromId: String, toId: String, cid: String, ks: String, salt: String) = "proximo-call-v1|$c|$fromId|$toId|$cid|$ks|$salt".toByteArray()
+    /** Envoie un message d'appel signé : il ne peut être ni fabriqué ni rejoué par un autre téléphone. */
+    private fun sendCall(peerId: String, j: JSONObject, cid: ByteArray, via: String?) {
+        val cidS = B64.enc(cid)
+        j.put("cid", cidS)
+        j.put("sg", B64.enc(Crypto.sign(me.sigPriv, callSigned(j.optString("c"), me.id, peerId, cidS, j.optString("ks"), j.optString("salt")))))
+        sendJson(peerId, j, via)
+    }
+    /**
+     * Le message d'appel vient-il vraiment de `from` ? Signé : la signature doit être juste. Non signé (version 1.5.0) :
+     * accepté seulement s'il arrive en direct du voisin prouvé lui-même, jamais par un relais.
+     */
+    private fun callAuthentic(j: JSONObject, from: String, fromPeer: String): Boolean {
+        val sg = j.optString("sg")
+        if (sg.isEmpty()) return fromPeer == from
+        val key = contactSigKey(from) ?: return false
+        return try { Crypto.verify(key, callSigned(j.optString("c"), from, me.id, j.optString("cid"), j.optString("ks"), j.optString("salt")), B64.dec(sg)) } catch (e: Exception) { false }
+    }
 
     private fun micOk() = androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
@@ -107,7 +132,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         val viaName = via?.let { db.contact(it)?.name ?: core.peer(it)?.name }
         state.value = CallState(CallState.RINGING_OUT, peerId, name, System.currentTimeMillis(), via = via, viaName = viaName)
         val j = JSONObject().put("c", "invite").put("salt", B64.enc(salt)).put("ks", B64.enc(mySalt)).apply { if (via != null) put("via", via) }
-        sendJson(peerId, j, via)
+        sendCall(peerId, j, mySalt, via)
         handler.postDelayed({ val st = state.value; if (st.phase == CallState.RINGING_OUT && st.peerId == peerId) { hangup(); MeshService.instance?.messenger?.event("Pas de réponse"); MeshService.instance?.messenger?.callNote(peerId, "📞 Appel sans réponse", false) } }, 45_000)
     }
 
@@ -119,14 +144,14 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         mySalt = Crypto.random(16)
         key = deriveKey(s.peerId, peerSalt, mySalt)
         if (key == null) { reject(); return }
-        sendJson(s.peerId, JSONObject().put("c", "accept").put("ks", B64.enc(mySalt)), s.via)
+        sendCall(s.peerId, JSONObject().put("c", "accept").put("ks", B64.enc(mySalt)), peerSalt, s.via)
         startAudio(s)
     }
 
     fun reject() {
         val s = state.value; if (s.phase != CallState.RINGING_IN) return
         handler.removeCallbacksAndMessages(null)
-        stopRing(); sendJson(s.peerId, JSONObject().put("c", "reject"), s.via)
+        stopRing(); sendCall(s.peerId, JSONObject().put("c", "reject"), peerSalt, s.via)
         state.value = CallState(CallState.IDLE, "", "", 0)
         NotificationManagerCompat.from(ctx).cancel(NOTIF)
     }
@@ -134,7 +159,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
     fun hangup() {
         val s = state.value
         if (s.phase == CallState.IDLE) return
-        if (s.phase != CallState.SEARCHING) sendJson(s.peerId, JSONObject().put("c", "hangup"), s.via)
+        if (s.phase != CallState.SEARCHING) sendCall(s.peerId, JSONObject().put("c", "hangup"), callId(), s.via)
         endCall()
     }
 
@@ -203,12 +228,24 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         val j = try { JSONObject(String(p)) } catch (e: Exception) { return true }
         val c = j.optString("c")
         val s = state.value
+        if (c in SIGNED) {
+            if (!callAuthentic(j, from, fromPeer)) { Log.w(tag, "message d'appel « $c » non vérifiable de $from : ignoré"); return true }
+            val cid = j.optString("cid")
+            if (cid.isNotEmpty()) {
+                // Une invitation ne sert qu'une fois ; les autres messages doivent porter l'identifiant de l'appel en cours.
+                if (c == "invite") { if (cid != j.optString("ks") || !seenInvites.add(cid)) return true; if (seenInvites.size > 500) seenInvites.clear() }
+                else if (s.phase == CallState.IDLE || cid != B64.enc(callId())) return true
+            }
+        }
+        // Relais fixe : ce téléphone ne prend pas d'appel.
+        if (c == "invite" && fr.proximo.app.core.Settings.get(ctx).relayMode) { sendCall(from, JSONObject().put("c", "reject"), try { B64.dec(j.optString("ks")) } catch (e: Exception) { ByteArray(0) }, j.optString("via").ifEmpty { null }); return true }
         when (c) {
             // Un voisin cherche un relais vers quelqu'un : je réponds si j'ai une prise Wi-Fi avec lui.
             "probe" -> { val to = j.optString("to"); if (core.hasWifiLink(to)) sendJson(from, JSONObject().put("c", "probe_ok").put("to", to), null) }
             "probe_ok" -> if (s.phase == CallState.SEARCHING && j.optString("to") == s.peerId) startOutgoing(s.peerId, s.peerName, from)
             "invite" -> {
-                if (s.phase != CallState.IDLE) { sendJson(from, JSONObject().put("c", "busy"), j.optString("via").ifEmpty { null }); return true }
+                val inviteCid = try { B64.dec(j.optString("ks")) } catch (e: Exception) { ByteArray(0) }
+                if (s.phase != CallState.IDLE) { sendCall(from, JSONObject().put("c", "busy"), inviteCid, j.optString("via").ifEmpty { null }); return true }
                 val name = db.contact(from)?.name ?: core.peer(from)?.name ?: "Inconnu"
                 val via = j.optString("via").ifEmpty { null }
                 // Le relais annoncé doit être celui par qui la trame est arrivée (sinon on répond en direct si possible).
@@ -216,9 +253,9 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                 salt = try { B64.dec(j.optString("salt")) } catch (e: Exception) { ByteArray(0) }
                 peerSalt = try { B64.dec(j.optString("ks")) } catch (e: Exception) { ByteArray(0) }
                 // Invitation sans aléa valide (ancienne version ou trame abîmée) : refusée, jamais de clé prévisible.
-                if (salt.size != 7 || peerSalt.size != 16 || contactKey(from) == null) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
+                if (salt.size != 7 || peerSalt.size != 16 || contactKey(from) == null) { sendCall(from, JSONObject().put("c", "reject"), inviteCid, useVia); return true }
                 // Seuls mes contacts peuvent faire sonner le téléphone (ou tout le monde si j'accepte les messages privés des inconnus).
-                if (db.contact(from)?.blocked == true || (db.contact(from)?.accepted != true && !fr.proximo.app.core.Settings.get(ctx).allowUnknownDm)) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
+                if (db.contact(from)?.blocked == true || (db.contact(from)?.accepted != true && !fr.proximo.app.core.Settings.get(ctx).allowUnknownDm)) { sendCall(from, JSONObject().put("c", "reject"), inviteCid, useVia); return true }
                 sendDir = 2; seq = 0; lastRecvSeq = -1
                 key = null
                 val viaName = useVia?.let { db.contact(it)?.name ?: core.peer(it)?.name }
@@ -336,5 +373,9 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         } catch (_: SecurityException) {}
     }
 
-    companion object { const val RATE = 8000; const val CHUNK = 320; const val NOTIF = 7 }
+    companion object {
+        const val RATE = 8000; const val CHUNK = 320; const val NOTIF = 7
+        /** Messages d'appel qui doivent être signés (ou venir en direct du voisin prouvé, pour la version 1.5.0). */
+        private val SIGNED = setOf("invite", "accept", "reject", "busy", "hangup")
+    }
 }

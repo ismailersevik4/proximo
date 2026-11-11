@@ -136,6 +136,7 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
                 when {
                     c?.blocked == true -> TextButton(onClick = { selected = null; val m = svc?.messenger; if (m != null) Thread { m.unblockContact(p.id) }.start() }) { Text("Débloquer") }
                     c?.accepted == true -> {
+                        TextButton(onClick = { selected = null; svc?.messenger?.let { m -> Thread { m.testLink(p.id) }.start() } }) { Text("Tester") }
                         TextButton(onClick = { selected = null; onOpenChat(p.id) }) { Text("Écrire") }
                         if (canCall) TextButton(onClick = { selected = null; svc?.calls?.call(p.id) }) { Text("Appeler") }
                     }

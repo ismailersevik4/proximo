@@ -55,6 +55,32 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         /** Côté réception : pas deux sonneries du même contact à moins de 20 s. */
         const val WIZZ_RING_GAP_MS = 20_000L
         private const val GINV = "ginv"
+        /** « Tu as été retiré du groupe » (envoyé par le créateur du groupe). */
+        private const val GBYE = "gbye"
+        private val READ_PREFIX = "proximo-read-v1|".toByteArray()
+
+        /** Texte caché dans des caractères invisibles (une ancienne version n'affiche que la phrase lisible qui précède). */
+        fun hide(hex: String): String = buildString { for (ch in hex) { val v = "0123456789abcdef".indexOf(ch); if (v < 0) return ""; for (b in 3 downTo 0) append(if ((v shr b) and 1 == 1) '\u200C' else '\u200B') } }
+        fun unhide(text: String): String? {
+            val bits = text.takeLastWhile { it == '\u200B' || it == '\u200C' }
+            if (bits.isEmpty() || bits.length % 4 != 0) return null
+            return buildString { for (i in bits.indices step 4) { var v = 0; for (k in 0 until 4) v = (v shl 1) or (if (bits[i + k] == '\u200C') 1 else 0); append("0123456789abcdef"[v]) } }
+        }
+        /** Aperçu d'un message sur une ligne (pour une réponse ou une réaction). */
+        fun previewOf(m: Message): String = when (m.kind) {
+            Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal"; Message.VIDEO -> "🎬 Vidéo"; Message.LOC -> "📍 Position"; Message.SOS -> "🆘 SOS"; Message.WIZZ -> "👋 Wizz"
+            else -> (splitQuote(m.body)?.second ?: m.body).replace('\n', ' ').trim()
+        }.let { if (it.length > 70) cut(it, 70) + "…" else it }
+        /** Coupe un texte sans casser un émoji en deux. */
+        fun cut(s: String, n: Int): String { if (s.length <= n) return s; val t = s.take(n); return if (t.isNotEmpty() && Character.isHighSurrogate(t.last())) t.dropLast(1) else t }
+        /** Première ligne d'un message qui répond à un autre : « ↪ Nom : aperçu ». */
+        fun quoteLine(name: String, m: Message): String = "↪ $name : ${previewOf(m)}"
+        /** (ligne citée, texte) si ce message est une réponse, sinon null. */
+        fun splitQuote(body: String): Pair<String, String>? {
+            if (!body.startsWith("↪ ")) return null
+            val nl = body.indexOf('\n'); if (nl < 3 || nl > 200) return null
+            return body.substring(2, nl) to body.substring(nl + 1)
+        }
         private const val CTX_ALL = "all"; private const val CTX_DM = "dm:"; private const val CTX_GROUP = "grp:"
         private val HEX16 = Regex("^[0-9a-f]{16}$")
     }
@@ -164,7 +190,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         }
         val file = blob?.let { saveBlob(mid, kind, it) }
         // L'invitation de groupe est une trame technique : elle ne s'affiche pas comme un message (elle montrait la clé du groupe en clair).
-        if (kind != GINV) db.saveMessage(Message(mid, chat, me.id, true, kind, body, file, time, Message.PENDING, true, ""))
+        if (kind != GINV && kind != GBYE && kind != Message.REACT) db.saveMessage(Message(mid, chat, me.id, true, kind, body, file, time, Message.PENDING, true, ""))
         frame?.let { core.send(it) }
     }
 
@@ -247,7 +273,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         if (existing?.accepted == true) { event("${card.name} est déjà dans tes contacts"); return }
         if (existing?.status == 2) { acceptContact(card.id); return }
         db.saveContact(card, 0)
-        core.send(Frame(Frame.CONTACT_REQ, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(card.id), me.card().toJson().toString().toByteArray()))
+        core.send(contactFrame(Frame.CONTACT_REQ, card.id))
         event("Demande envoyée à ${card.name}")
     }
 
@@ -267,7 +293,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val c = db.contact(id) ?: return
         db.setContactStatus(id, 1)
         core.replayHeld(id)
-        core.send(Frame(Frame.CONTACT_ACCEPT, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(id), me.card().toJson().toString().toByteArray()))
+        core.send(contactFrame(Frame.CONTACT_ACCEPT, id))
         db.saveMessage(Message(Hex.enc(Frame.newId()), id, me.id, true, Message.SYS, "Vous êtes maintenant en contact", null, System.currentTimeMillis(), Message.DELIVERED, true, ""))
     }
     fun refuseContact(id: String) { db.deleteContact(id) }
@@ -279,14 +305,112 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         try { NotificationManagerCompat.from(ctx).cancel(id.hashCode()) } catch (_: Exception) {}
         event("$name est bloqué. Tu peux le débloquer dans Contacts.")
     }
+    /** Bloquer l'expéditeur d'un message, même s'il n'est pas dans les contacts (« Tout le monde », groupe, inconnu). */
+    fun blockSender(id: String, name: String) {
+        if (id == me.id || id == Db.ALL || db.group(id) != null) return
+        if (db.contact(id) != null) { blockContact(id); return }
+        db.blockUnknown(id, name)
+        try { NotificationManagerCompat.from(ctx).cancel(id.hashCode()) } catch (_: Exception) {}
+        event("${name.ifBlank { "Ce téléphone" }} est bloqué. Tu peux le débloquer dans Contacts.")
+    }
     fun unblockContact(id: String) {
-        val name = db.contact(id)?.name ?: return
+        val c = db.contact(id) ?: return
+        val name = c.name
+        // Inconnu bloqué (jamais été un contact) : on retire simplement sa ligne.
+        if (c.status == 3) { db.removeContactRow(id); event("$name est débloqué"); return }
         db.setBlocked(id, false)
         // Ma demande de contact était partie avant le blocage et sa réponse a été ignorée : je la renvoie.
-        if (db.contact(id)?.status == 0) cards[id]?.let { core.send(Frame(Frame.CONTACT_REQ, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(id), me.card().toJson().toString().toByteArray())) }
+        if (db.contact(id)?.status == 0) cards[id]?.let { core.send(contactFrame(Frame.CONTACT_REQ, id)) }
         event("$name est débloqué")
     }
     private fun isBlocked(id: String) = db.contact(id)?.blocked == true
+
+    // ---------- réactions ----------
+    /** Réagir à un message. Sur une version plus ancienne, la réaction s'affiche comme un petit message « 👍 « aperçu » ». */
+    fun react(chat: String, target: Message, emoji: String) {
+        scope.launch {
+            try {
+                db.setReaction(chat, target.mid, me.id, emoji)
+                sendMessageNow(chat, Message.REACT, "$emoji « ${cut(previewOf(target), 30)} »" + hide(target.mid.take(8)), null, 0, Frame.DEFAULT_TTL)
+            } catch (e: Exception) { Log.e(tag, "réaction", e) }
+        }
+    }
+    private fun onReaction(chat: String, from: String, senderName: String, body: String) {
+        val prefix = unhide(body) ?: return
+        val emoji = body.substringBefore(' ').take(8)
+        if (emoji.isBlank()) return
+        val target = db.messageByPrefix(chat, prefix) ?: return
+        db.setReaction(chat, target.mid, from, emoji)
+        if (target.mine && !isShowing(chat)) notify(senderName, "$emoji à ton message : ${cut(previewOf(target), 40)}", chat, false, silent = true)
+    }
+
+    // ---------- accusé de lecture « Lu » ----------
+    /** Marque une discussion comme lue et, en discussion privée, prévient l'expéditeur que ses messages ont été lus. */
+    @Synchronized fun markChatRead(chat: String) {
+        val mids = try { db.unreadIncoming(chat) } catch (e: Exception) { emptyList() }
+        db.markRead(chat)
+        if (mids.isNotEmpty()) sendRead(chat, mids)
+    }
+    private fun sendRead(chat: String, mids: List<String>) {
+        if (!settings.readReceipts || settings.relayMode) return
+        if (db.contact(chat)?.accepted != true) return // seulement en discussion privée, avec un contact
+        // 6 messages par trame : elle reste assez courte pour un petit message Wi-Fi direct.
+        for (batch in mids.chunked(6)) try {
+            val ids = java.io.ByteArrayOutputStream().apply { for (m in batch) write(Hex.dec(m)) }.toByteArray()
+            val payload = byteArrayOf(batch.size.toByte()) + ids + Crypto.sign(me.sigPriv, READ_PREFIX + ids) + me.sigPub
+            core.send(Frame(Frame.READ, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(chat), payload))
+        } catch (e: Exception) { Log.e(tag, "accusé de lecture", e) }
+    }
+    /** « Lu » reçu : [nombre (1)][identifiants (16 chacun)][signature (64)][clé publique (32)], signé par celui qui a lu. */
+    private fun onRead(f: Frame) {
+        val p = f.payload
+        if (p.isEmpty()) return
+        val n = p[0].toInt() and 0xff
+        if (n < 1 || n > 12 || p.size != 1 + 16 * n + 96) return
+        val ids = p.copyOfRange(1, 1 + 16 * n)
+        val sig = p.copyOfRange(1 + 16 * n, 65 + 16 * n); val pub = p.copyOfRange(65 + 16 * n, p.size)
+        val ok = try { Identity.idOf(pub) == f.fromHex && Crypto.verify(pub, READ_PREFIX + ids, sig) } catch (e: Exception) { false }
+        if (!ok) return
+        for (i in 0 until n) {
+            val mid = Hex.enc(ids.copyOfRange(16 * i, 16 * i + 16))
+            val m = db.message(mid) ?: continue
+            if (!m.mine || m.chat != f.fromHex || m.status == Message.FAILED) continue
+            db.setStatus(mid, Message.READ)
+            db.removeOutbox(mid)
+        }
+    }
+
+    // ---------- test de liaison ----------
+    private val pings = ConcurrentHashMap<String, Pair<String, Long>>()
+    /** Envoie un aller-retour à un contact et affiche par où il est passé et en combien de temps. */
+    fun testLink(peerId: String) {
+        val c = db.contact(peerId)
+        if (c?.accepted != true) { event("Le test de liaison marche avec un contact accepté"); return }
+        val nonce = Crypto.random(8); val key = Hex.enc(nonce)
+        pings[key] = peerId to android.os.SystemClock.elapsedRealtime()
+        core.send(Frame(Frame.ECHO, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), byteArrayOf(1) + nonce))
+        event("Test de liaison avec ${c.name}…")
+        mainHandler.postDelayed({ if (pings.remove(key) != null) event("Pas de réponse de ${c.name} en 15 s : hors de portée, ou son Proximo est plus ancien que la 1.6.0") }, 15_000)
+    }
+    private fun onEcho(f: Frame) {
+        val p = f.payload
+        if (p.size < 9) return
+        val nonce = p.copyOfRange(1, 9)
+        when (p[0].toInt()) {
+            // Question : je ne réponds qu'à mes contacts (un inconnu ne peut pas s'en servir pour savoir si je suis là).
+            1 -> if (db.contact(f.fromHex)?.accepted == true) core.send(Frame(Frame.ECHO, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, byteArrayOf(2) + nonce + byteArrayOf(f.hops.toByte())))
+            2 -> {
+                val (peer, t0) = pings.remove(Hex.enc(nonce)) ?: return
+                if (peer != f.fromHex) return
+                val ms = android.os.SystemClock.elapsedRealtime() - t0
+                val relays = maxOf(if (p.size > 9) p[9].toInt() and 0xff else 0, f.hops)
+                val name = db.contact(peer)?.name ?: "ce contact"
+                val path = if (relays == 0) "en direct (" + (if (core.hasWifiLink(peer)) "Wi-Fi direct et Bluetooth" else "Bluetooth seulement") + ")" else "via $relays relais"
+                val time = if (ms < 1000) "$ms ms" else "%.1f s".format(java.util.Locale.FRANCE, ms / 1000.0)
+                event("Liaison avec $name : $path · aller-retour en $time")
+            }
+        }
+    }
 
     /** Trace d'un appel dans la discussion (« Appel manqué », « Appel sans réponse »), avec notification si demandé. */
     fun callNote(peerId: String, text: String, notifyUser: Boolean) {
@@ -382,12 +506,47 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         return g
     }
 
-    fun addToGroup(groupId: String, memberId: String) {
+    /** Le créateur du groupe ajoute des contacts : tout le monde reçoit la liste à jour (et les nouveaux, la clé). */
+    fun addToGroup(groupId: String, memberIds: List<String>) {
         val g = db.group(groupId) ?: return
-        if (memberId in g.members) return
-        val ng = g.copy(members = g.members + memberId)
+        if (g.owner != me.id) { event("Seul le créateur du groupe peut ajouter des membres"); return }
+        val add = memberIds.filter { it !in g.members && db.contact(it)?.accepted == true }
+        if (add.isEmpty()) return
+        val ng = g.copy(members = g.members + add)
         db.saveGroup(ng)
         shareGroup(ng, ng.members.filter { it != me.id })
+        val names = add.joinToString(", ") { db.contact(it)?.name ?: "?" }
+        db.saveMessage(Message(Hex.enc(Frame.newId()), g.id, me.id, true, Message.SYS, "Ajouté au groupe : $names", null, System.currentTimeMillis(), Message.DELIVERED, true, ""))
+    }
+
+    /**
+     * Le créateur retire un membre : le groupe change de clé (l'ancien membre ne peut plus lire la suite),
+     * les autres reçoivent la nouvelle clé, et l'ancien membre est prévenu.
+     */
+    fun removeFromGroup(groupId: String, memberId: String) {
+        val g = db.group(groupId) ?: return
+        if (g.owner != me.id) { event("Seul le créateur du groupe peut retirer des membres"); return }
+        if (memberId == me.id || memberId !in g.members) return
+        val ng = g.copy(members = g.members - memberId, key = Crypto.random(32))
+        db.saveGroup(ng)
+        shareGroup(ng, ng.members.filter { it != me.id })
+        // (L'empreinte de l'ancienne clé est jointe : si le membre est rajouté entre-temps, ce retrait périmé est ignoré.)
+        if (db.contact(memberId) != null) sendMessage(memberId, GBYE, "Tu as été retiré du groupe « ${g.name} »" + hide(g.id + Hex.enc(Crypto.sha256(g.key)).take(8)), null)
+        val name = db.contact(memberId)?.name ?: "Un membre"
+        db.saveMessage(Message(Hex.enc(Frame.newId()), g.id, me.id, true, Message.SYS, "$name a été retiré du groupe", null, System.currentTimeMillis(), Message.DELIVERED, true, ""))
+    }
+
+    /** Le créateur du groupe m'en a retiré. */
+    private fun onGroupBye(from: String, senderName: String, body: String) {
+        val h = unhide(body) ?: return
+        if (h.length < 16) return
+        val gid = h.take(16); val fp = h.drop(16)
+        val g = db.group(gid) ?: return
+        if (g.owner != from) return
+        if (fp.isNotEmpty() && Hex.enc(Crypto.sha256(g.key)).take(8) != fp) return // rajouté depuis avec une nouvelle clé : ce retrait est périmé
+        db.deleteGroup(gid)
+        event("$senderName t'a retiré du groupe « ${g.name} »")
+        notify(senderName, "t'a retiré du groupe « ${g.name} »", from, false)
     }
 
     fun leaveGroup(groupId: String) { db.deleteGroup(groupId) }
@@ -404,8 +563,10 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         when (f.type) {
             Frame.CARD_REQ -> { core.send(Frame(Frame.CARD, 0, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray())); sendAvatar(f.fromHex, force = false) }
             Frame.CARD -> onCard(f)
-            Frame.CONTACT_REQ -> onContactReq(f)
-            Frame.CONTACT_ACCEPT -> onContactAccept(f)
+            Frame.CONTACT_REQ -> return onContactReq(f, fromPeer)
+            Frame.CONTACT_ACCEPT -> return onContactAccept(f, fromPeer)
+            Frame.ECHO -> onEcho(f)
+            Frame.READ -> onRead(f)
             Frame.DM -> return onDm(f)
             Frame.GROUP -> return onGroup(f)
             Frame.PUBLIC, Frame.SOS -> onPublic(f)
@@ -433,21 +594,54 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         db.pendingCodes().firstOrNull { it == card.shortCode }?.let { db.removePendingCode(it); addFromCard(card) }
     }
 
-    private fun onContactReq(f: Frame) {
-        val card = cardOf(f) ?: return
+    /**
+     * Demande ou acceptation de contact : ma carte + pour qui elle est + une signature qui lie le tout
+     * (une demande ne peut plus être rejouée par quelqu'un d'autre, ni présentée à un autre téléphone).
+     */
+    private fun contactFrame(type: Int, toId: String): Frame {
+        val card = me.card()
+        val fid = Frame.newId()
+        val bs = Crypto.sign(me.sigPriv, contactSigned(type, card.id, toId, card.time, Hex.enc(fid)))
+        val json = card.toJson().put("to", toId).put("bs", B64.enc(bs))
+        return Frame(type, Frame.DEFAULT_TTL, 0, 0, fid, core.myIdBytes(), Hex.dec(toId), json.toString().toByteArray())
+    }
+    /** L'identifiant de la trame est signé aussi : une demande rejouée garde le même identifiant et tombe sur le dédoublonnage. */
+    private fun contactSigned(type: Int, fromId: String, toId: String, time: Long, fid: String) = "proximo-contact-v1|$type|$fromId|$toId|$time|$fid".toByteArray()
+    /** Signée pour moi par l'expéditeur ; sans signature (version 1.5.0), acceptée seulement si elle arrive en direct du voisin prouvé qui l'envoie. */
+    /** 1 = bonne ; 0 = fausse ; -1 = non signée et venue d'un relais (à réessayer quand elle arrivera en direct). */
+    private fun contactFrameCheck(f: Frame, card: Card, fromPeer: String): Int = try {
+        val o = JSONObject(String(f.payload))
+        val bs = o.optString("bs")
+        if (bs.isEmpty()) { if (f.hops == 0 && fromPeer == f.fromHex) 1 else -1 }
+        else if (o.optString("to") == me.id && Crypto.verify(card.sigPub, contactSigned(f.type, card.id, me.id, card.time, f.fidHex), B64.dec(bs))) 1 else 0
+    } catch (e: Exception) { 0 }
+
+    /** Rend false si la trame doit être réessayée plus tard (non signée venue d'un relais : le cœur ne la note pas « vue »). */
+    private fun onContactReq(f: Frame, fromPeer: String): Boolean {
+        val card = cardOf(f) ?: return true
+        when (contactFrameCheck(f, card, fromPeer)) { -1 -> return false; 0 -> { Log.w(tag, "demande de contact non vérifiable de ${card.id} : ignorée"); return true } }
+        contactReq(f, card)
+        return true
+    }
+    private fun contactReq(f: Frame, card: Card) {
         cards[card.id] = card
         val existing = db.contact(card.id)
         if (existing?.blocked == true) return // bloqué : sa demande est ignorée, sans rien afficher
         core.replayHeld(card.id)
         when {
-            existing?.accepted == true -> { db.saveContact(card, 1); core.send(Frame(Frame.CONTACT_ACCEPT, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray())) }
+            existing?.accepted == true -> { db.saveContact(card, 1); core.send(contactFrame(Frame.CONTACT_ACCEPT, f.fromHex)) }
             existing?.status == 0 -> { db.saveContact(card, 1); acceptContact(card.id) }   // on s'était ajoutés mutuellement
             else -> { db.saveContact(card, 2); event("${card.name} veut t'ajouter en contact"); notify("Demande de contact", "${card.name} veut t'ajouter", "contacts", false) }
         }
     }
 
-    private fun onContactAccept(f: Frame) {
-        val card = cardOf(f) ?: return
+    private fun onContactAccept(f: Frame, fromPeer: String): Boolean {
+        val card = cardOf(f) ?: return true
+        when (contactFrameCheck(f, card, fromPeer)) { -1 -> return false; 0 -> { Log.w(tag, "acceptation de contact non vérifiable de ${card.id} : ignorée"); return true } }
+        contactAccept(card)
+        return true
+    }
+    private fun contactAccept(card: Card) {
         cards[card.id] = card
         // Une « acceptation » ne vaut que si JE lui ai demandé (demande envoyée) ou si on est déjà en contact.
         // Sans ça, n'importe quel téléphone pouvait se déclarer « accepté » tout seul.
@@ -488,6 +682,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         db.markAcked(f.fidHex) // si l'expéditeur ne reçoit pas cet accusé et renvoie le message, on saura le lui redonner
         when (kind) {
             GINV -> onGroupInvite(from, inn.json.optString("b"))
+            GBYE -> onGroupBye(from, senderName, inn.json.optString("b"))
             else -> store(f, from, from, senderName, inn, kind)
         }
         return true
@@ -522,7 +717,9 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val gid = Hex.enc(f.payload.copyOfRange(0, 8))
         // Groupe pas encore connu (l'invitation n'est pas arrivée) : on garde la possibilité de rejouer.
         val g = db.group(gid) ?: return false
-        val plain = Crypto.aesDecrypt(g.key, f.payload.copyOfRange(8, f.payload.size), f.fid) ?: return true
+        // Déchiffrement raté : la clé du groupe a sans doute changé (un membre retiré) et la nouvelle n'est pas encore arrivée.
+        // Le message est mis de côté et rejoué à l'arrivée de la nouvelle clé, au lieu d'être perdu.
+        val plain = Crypto.aesDecrypt(g.key, f.payload.copyOfRange(8, f.payload.size), f.fid) ?: return false
         val inn = parseInner(plain) ?: return true
         val from = f.fromHex
         val contact = db.contact(from)
@@ -577,6 +774,8 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val mid = f.fidHex
         if (db.message(mid) != null) return
         val body = inn.json.optString("b")
+        // Une réaction s'accroche au message visé : elle n'est pas enregistrée comme un message.
+        if (kind == Message.REACT) { onReaction(chat, from, senderName, body); return }
         val file = inn.blob?.let { saveBlob(mid, kind, it) }
         val isOpen = isShowing(chat)
         val route = if (f.hops == 0) "direct" else "${f.hops} saut(s)"
@@ -586,6 +785,8 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         db.saveMessage(Message(mid, chat, from, false, kind, body, file, sentAt, Message.DELIVERED, isOpen, route, senderName, now))
         val late = now - sentAt > 3600_000L
         db.touchContact(from)
+        // Discussion privée sous mes yeux : le message est lu tout de suite, l'expéditeur le saura.
+        if (isOpen && chat == from) sendRead(chat, listOf(mid))
         if (kind == Message.WIZZ) { onWizz(chat, from, senderName, now - sentAt, isOpen); return }
         val preview = when (kind) {
             Message.PHOTO -> "📷 Photo"; Message.VOICE -> "🎤 Vocal (${body}s)"; Message.VIDEO -> "🎬 Vidéo (${body}s)"; Message.LOC -> "📍 Position"; Message.SOS -> "🆘 SOS"; else -> body
@@ -605,7 +806,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val fresh = ageMs <= WIZZ_FRESH_MS
         val lastRing = wizzRungAt[from]
         val ring = direct && fresh && (lastRing == null || now - lastRing >= WIZZ_RING_GAP_MS)
-        if (ring) { wizzRungAt[from] = now; ringWizz(); shake(chat) }
+        if (ring && !settings.relayMode) { wizzRungAt[from] = now; ringWizz(); shake(chat) }
         if (!isOpen) notify(senderName, if (fresh) "👋 Wizz !" else "👋 Wizz (arrivé en retard)", chat, false, silent = true)
     }
 
@@ -667,6 +868,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
 
     // ---- notifications et sons ----
     private fun notify(title: String, text: String, chat: String, sos: Boolean, silent: Boolean = false) {
+        if (settings.relayMode) return // relais fixe : ce téléphone ne sonne pas et n'affiche rien
         try {
             val i = Intent(ctx, MainActivity::class.java).putExtra("chat", chat).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
             val pi = PendingIntent.getActivity(ctx, chat.hashCode(), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -694,7 +896,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private val voiceQueue = java.util.concurrent.ConcurrentLinkedQueue<String>()
     private val voicePlaying = java.util.concurrent.atomic.AtomicBoolean(false)
     private fun queueVoice(path: String) {
-        if (voiceQueue.size >= 20) return
+        if (voiceQueue.size >= 20 || settings.relayMode) return
         voiceQueue.add(path)
         mainHandler.post { playNextVoice() }
     }

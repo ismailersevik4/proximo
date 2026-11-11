@@ -34,8 +34,10 @@ data class Message(
     /** Heure qui range le message dans la discussion : son arrivée sur ce téléphone (ou son envoi, pour les miens). */
     val shownAt: Long get() = if (received > 0) received else time
     companion object {
-        const val PENDING = 0; const val RELAYED = 1; const val DELIVERED = 2; const val FAILED = 3
+        const val PENDING = 0; const val RELAYED = 1; const val DELIVERED = 2; const val FAILED = 3; const val READ = 4
         const val TEXT = "text"; const val PHOTO = "photo"; const val VOICE = "voice"; const val VIDEO = "video"; const val LOC = "loc"; const val SOS = "sos"; const val SYS = "sys"; const val WIZZ = "wizz"
+        /** Réaction à un message (👍…) : n'est pas affichée comme un message, elle s'accroche au message visé. */
+        const val REACT = "react"
     }
 }
 
@@ -48,7 +50,7 @@ data class Outbox(val fid: String, val data: ByteArray, val dest: String, val cr
     /** Type de la trame (Frame.SOS, Frame.DM…), 0 si inconnu : les SOS passent en tête de file. */
     val type: Int = if (data.size > 3) data[3].toInt() and 0xff else 0)
 
-class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 6) {
+class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 7) {
     /** Les gros contenus (file d'attente, trames mises de côté) sont en fichiers : SQLite refuse les lignes de plus de 2 Mo. */
     private val outboxDir = java.io.File(ctx.filesDir, "outbox").also { it.mkdirs() }
     private val heldDir = java.io.File(ctx.filesDir, "held").also { it.mkdirs() }
@@ -66,6 +68,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         db.execSQL("CREATE TABLE outbox(fid TEXT PRIMARY KEY, data BLOB, dest TEXT, created INTEGER, sent_to TEXT, mine INTEGER, type INTEGER DEFAULT 0)")
         db.execSQL("CREATE TABLE held(fid TEXT PRIMARY KEY, from_id TEXT, peer TEXT, t INTEGER)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
+        db.execSQL("CREATE TABLE reactions(chat TEXT, mid TEXT, sender TEXT, emoji TEXT, t INTEGER, PRIMARY KEY(mid, sender))")
         db.execSQL("CREATE TABLE acked(fid TEXT PRIMARY KEY, t INTEGER)")
         db.execSQL("CREATE INDEX idx_msg_unread ON messages(chat) WHERE read=0 AND mine=0")
         db.execSQL("CREATE INDEX idx_msg_arrival ON messages(chat, $ARRIVAL)")
@@ -82,6 +85,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_msg_arrival ON messages(chat, $ARRIVAL)")
             db.execSQL("DELETE FROM messages WHERE kind='ginv'")
         }
+        if (o < 7) db.execSQL("CREATE TABLE IF NOT EXISTS reactions(chat TEXT, mid TEXT, sender TEXT, emoji TEXT, t INTEGER, PRIMARY KEY(mid, sender))")
         if (o < 6) {
             // Contacts bloqués, et type des trames en attente (pour faire passer les SOS en premier).
             db.execSQL("ALTER TABLE contacts ADD COLUMN blocked INTEGER DEFAULT 0")
@@ -134,8 +138,36 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         deleteFilesOf(id)
         writableDatabase.delete("contacts", "id=?", arrayOf(id)); writableDatabase.delete("messages", "chat=?", arrayOf(id)); bump()
     }
+    // ---------- réactions ----------
+    /** Une réaction par personne et par message (la nouvelle remplace l'ancienne). */
+    fun setReaction(chat: String, mid: String, sender: String, emoji: String) {
+        writableDatabase.execSQL("INSERT OR REPLACE INTO reactions VALUES(?,?,?,?,?)", arrayOf(chat, mid, sender, emoji, System.currentTimeMillis())); bump()
+    }
+    /** Réactions d'une discussion : identifiant du message -> émojis, dans l'ordre d'arrivée. */
+    fun reactions(chat: String): Map<String, List<String>> =
+        q("SELECT mid, emoji FROM reactions WHERE chat=? ORDER BY t", chat) { it.getString(0) to it.getString(1) }.groupBy({ it.first }, { it.second })
+    /** Le message d'une discussion dont l'identifiant commence par ces caractères hexadécimaux. */
+    fun messageByPrefix(chat: String, prefix: String): Message? =
+        if (prefix.length < 8 || prefix.any { it !in "0123456789abcdef" }) null
+        else q("SELECT * FROM messages WHERE chat=? AND mid LIKE ? LIMIT 1", chat, "$prefix%") { readMsg(it) }.firstOrNull()
+
+    /** Messages reçus pas encore lus d'une discussion (pour l'accusé de lecture). */
+    fun unreadIncoming(chat: String): List<String> = q("SELECT mid FROM messages WHERE chat=? AND read=0 AND mine=0 AND kind!='sys'", chat) { it.getString(0) }
+
+    /** Bloquer un téléphone qui n'est pas dans les contacts : une ligne sans clés (statut 3), supprimée au déblocage. */
+    fun blockUnknown(id: String, name: String) {
+        if (contact(id) != null) { setBlocked(id, true); return }
+        val cv = ContentValues().apply { put("id", id); put("name", name.ifBlank { "Inconnu" }); put("dh", ByteArray(0)); put("sg", ByteArray(0)); put("status", 3); put("added", System.currentTimeMillis()); put("last_seen", 0L); put("blocked", 1) }
+        writableDatabase.insert("contacts", null, cv)
+        writableDatabase.execSQL("UPDATE messages SET read=1 WHERE chat=? AND read=0", arrayOf(id))
+        bump()
+    }
+    /** Retire seulement la ligne du contact (ses messages restent). */
+    fun removeContactRow(id: String) { writableDatabase.delete("contacts", "id=?", arrayOf(id)); bump() }
+
     /** Photos, vocaux et vidéos d'une discussion qu'on supprime. */
     private fun deleteFilesOf(chat: String) {
+        writableDatabase.delete("reactions", "chat=?", arrayOf(chat))
         for (f in q("SELECT file FROM messages WHERE chat=? AND file IS NOT NULL", chat) { it.getString(0) }) try { java.io.File(f).delete() } catch (_: Exception) {}
     }
 
@@ -173,7 +205,8 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     }
     fun setStatus(mid: String, status: Int, route: String? = null) {
         // « Reçu » l'emporte toujours, même sur un ancien « Échec » (accusé arrivé très tard).
-        val expr = if (status == Message.DELIVERED) "?" else "MAX(status,?)"
+        // … et « Lu » l'emporte sur « Reçu » (un accusé de réception renvoyé plus tard ne le fait pas redescendre).
+        val expr = when (status) { Message.READ -> "?"; Message.DELIVERED -> "CASE WHEN status=${Message.READ} THEN status ELSE ? END"; else -> "MAX(status,?)" }
         if (route != null) writableDatabase.execSQL("UPDATE messages SET status=$expr, route=? WHERE mid=?", arrayOf(status, route, mid))
         else writableDatabase.execSQL("UPDATE messages SET status=$expr WHERE mid=?", arrayOf(status, mid))
         bump()
@@ -187,10 +220,12 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     fun unreadTotal(): Int = q("SELECT COUNT(*) FROM messages WHERE read=0 AND mine=0") { it.getInt(0) }.firstOrNull() ?: 0
     fun deleteMessage(mid: String) {
         message(mid)?.file?.let { java.io.File(it).delete() }
+        writableDatabase.delete("reactions", "mid=?", arrayOf(mid))
         writableDatabase.delete("messages", "mid=?", arrayOf(mid)); bump()
     }
     fun clearChat(chat: String) {
         for (f in q("SELECT file FROM messages WHERE chat=? AND file IS NOT NULL", chat) { it.getString(0) }) java.io.File(f).delete()
+        writableDatabase.delete("reactions", "chat=?", arrayOf(chat))
         writableDatabase.delete("messages", "chat=?", arrayOf(chat)); bump()
     }
 

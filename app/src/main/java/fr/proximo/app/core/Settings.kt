@@ -26,6 +26,20 @@ class Settings private constructor(ctx: Context) {
         get() = p.getBoolean("unknownDm", false)
         set(v) { p.edit().putBoolean("unknownDm", v).apply(); bump() }
 
+    /** Envoyer un accusé de lecture (« Lu ») quand j'ouvre une discussion privée. */
+    var readReceipts: Boolean
+        get() = p.getBoolean("readReceipts", true)
+        set(v) { p.edit().putBoolean("readReceipts", v).apply(); bump() }
+
+    /** Mode relais fixe : ce téléphone ne fait que relayer (aucune sonnerie, aucune notification, portée maximale). */
+    var relayMode: Boolean
+        get() = p.getBoolean("relayMode", false)
+        set(v) { p.edit().putBoolean("relayMode", v).apply(); bump() }
+
+    /** Brouillon d'une discussion (texte tapé mais pas envoyé). */
+    fun draft(chat: String): String = p.getString("draft_$chat", "") ?: ""
+    fun setDraft(chat: String, text: String) { if (text.isBlank()) p.edit().remove("draft_$chat").apply() else p.edit().putString("draft_$chat", text.take(4000)).apply() }
+
     /** Sons de notification. */
     var sounds: Boolean
         get() = p.getBoolean("sounds", true)

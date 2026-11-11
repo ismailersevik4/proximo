@@ -54,7 +54,12 @@ fun SettingsScreen(onBack: () -> Unit) {
             Section("Messages") {
                 SwitchRow("Lire les vocaux à l'arrivée", "Comme un talkie-walkie : le vocal est joué au haut-parleur dès qu'il arrive.", settings.autoPlayVoice) { settings.autoPlayVoice = it }
                 SwitchRow("Sons de notification", "Son à chaque nouveau message. Les SOS sonnent toujours.", settings.sounds) { settings.sounds = it }
+                SwitchRow("Accusés de lecture", "Tes contacts voient « Lu » quand tu ouvres leurs messages privés. Désactivé, ils ne voient que « Reçu ».", settings.readReceipts) { settings.readReceipts = it }
                 SwitchRow("Messages privés des inconnus", "Accepter les messages privés de téléphones qui ne sont pas dans tes contacts.", settings.allowUnknownDm) { settings.allowUnknownDm = it }
+            }
+            Spacer(Modifier.height(14.dp))
+            Section("Relais fixe") {
+                SwitchRow("Ce téléphone sert de relais", "Pour un téléphone laissé branché à un endroit fixe (fenêtre, magasin) : il relaie les messages des autres à portée maximale, sans sonner, sans notification et sans prendre d'appel. Désactive-le pour t'en servir normalement.", settings.relayMode) { settings.relayMode = it }
             }
             Spacer(Modifier.height(14.dp))
             Section("Réseau et mises à jour") {

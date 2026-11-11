@@ -61,8 +61,11 @@ class MeshService : Service() {
         core.onLinkUp = { p -> messenger.onPeerAppeared(p); updater.onPeerAppeared(p) }
         // Ancienne version à portée (pas de preuve d'identité) : on lui propose seulement la mise à jour.
         core.onLimited = { id -> updater.onOldPeer(id) }
-        core.setMode(Settings.get(this).mode)
+        appliedMode = effectiveMode()
+        core.setMode(appliedMode)
         core.start()
+        // Un changement dans les réglages (mode de connexion, relais fixe) s'applique tout de suite, sans redémarrer le réseau.
+        scope.launch { Settings.get(this@MeshService).changes.collect { val e = effectiveMode(); if (e != appliedMode) { appliedMode = e; core.setMode(e) }; applyWakeLock() } }
         messenger.start()
         updater.startPeriodicOffers()
         // Garde le processeur éveillé pour le Bluetooth quand l'écran est éteint (les vieux téléphones coupent sinon).
@@ -128,13 +131,17 @@ class MeshService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    fun updateMode(mode: Int) { core.setMode(mode); applyWakeLock() }
+    fun updateMode(mode: Int) { val e = effectiveMode(); appliedMode = e; core.setMode(e); applyWakeLock() }
+
+    private var appliedMode = Modes.NORMAL
+    /** Le mode vraiment utilisé : en relais fixe, toujours « Priorité portée ». */
+    private fun effectiveMode(): Int { val s = Settings.get(this); return if (s.relayMode) Modes.PORTEE else s.mode }
 
     private fun applyWakeLock() {
         val wl = wakeLock ?: return
         try {
             // Avant Android 12, on le garde toujours : les vieux téléphones arrêtent la recherche Bluetooth quand ils dorment.
-            val keep = Settings.get(this).mode != Modes.BATTERIE || Build.VERSION.SDK_INT < 31 || core.peers.value.isNotEmpty()
+            val keep = effectiveMode() != Modes.BATTERIE || Build.VERSION.SDK_INT < 31 || core.peers.value.isNotEmpty()
             if (keep && !wl.isHeld) wl.acquire() else if (!keep && wl.isHeld) wl.release()
         } catch (_: Exception) {}
     }

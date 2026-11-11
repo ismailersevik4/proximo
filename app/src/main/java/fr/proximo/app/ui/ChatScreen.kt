@@ -17,6 +17,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -38,6 +41,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Vibration
@@ -79,6 +83,7 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import coil.compose.AsyncImage
 import fr.proximo.app.MainActivity
 import fr.proximo.app.core.Db
+import fr.proximo.app.msg.Messenger
 import fr.proximo.app.core.Message
 import fr.proximo.app.mesh.MeshService
 import kotlinx.coroutines.Dispatchers
@@ -99,7 +104,28 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     val names by dbState(emptyMap<String, String>()) { d -> d.contacts().associate { c -> c.id to c.name } }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
-    var text by rememberSaveable(chat) { mutableStateOf("") } // le brouillon survit à une rotation ou à un appel
+    // Le brouillon est gardé par discussion : on le retrouve en revenant, même après avoir fermé l'appli.
+    val store = remember { fr.proximo.app.core.Settings.get(ctx) }
+    var text by rememberSaveable(chat) { mutableStateOf(store.draft(chat)) }
+    val textNow by androidx.compose.runtime.rememberUpdatedState(text)
+    DisposableEffect(chat) { onDispose { store.setDraft(chat, textNow) } }
+    /** Message auquel on est en train de répondre. */
+    var replyTo by remember(chat) { mutableStateOf<Message?>(null) }
+    var membersDialog by remember { mutableStateOf(false) }
+    var blockSender by remember { mutableStateOf<Message?>(null) }
+    val reactions by dbState(emptyMap<String, List<String>>()) { it.reactions(chat) }
+    val accepted by dbState(emptyList<fr.proximo.app.core.Contact>()) { it.acceptedContacts() }
+    // Prise Wi-Fi directe ouverte avec ce contact ? (relu toutes les 3 s)
+    val wifiLink by androidx.compose.runtime.produceState(false, svc, chat) {
+        while (true) { value = svc?.core?.hasWifiLink(chat) == true; kotlinx.coroutines.delay(3000) }
+    }
+    // Appel possible avec ce contact (en direct ou via un voisin) ? Recalculé toutes les 3 s hors du fil d'affichage, et vérifié pour de bon au toucher.
+    val can by androidx.compose.runtime.produceState(false, svc, chat) {
+        while (true) { value = withContext(Dispatchers.IO) { svc?.calls?.canCall(chat) == true }; kotlinx.coroutines.delay(3000) }
+    }
+    var removeMember by remember { mutableStateOf<String?>(null) }
+    /** Liaison en Bluetooth seulement : photos et vocaux sont compressés plus fort pour partir vite. */
+    fun lightMedia(): Boolean = svc?.core?.let { k -> if (chat == Db.ALL || group != null) k.wifiLinkedPeers().isEmpty() else !k.hasWifiLink(chat) } ?: true
     var recording by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var sosDialog by remember { mutableStateOf(false) }
@@ -110,13 +136,15 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     // L'écran change pendant un enregistrement (appel entrant…) : le micro est toujours libéré.
     DisposableEffect(Unit) { onDispose { recorder.cancel() } }
 
-    val title = when { isAll -> "Tout le monde"; group != null -> group!!.name; else -> contact?.name ?: "Discussion" }
+    // Discussion d'un téléphone qui n'est pas dans les contacts : son pseudo tel qu'il s'est présenté.
+    val unknownName = peers.firstOrNull { it.id == chat }?.name ?: messages.lastOrNull { !it.mine && it.senderName.isNotBlank() }?.senderName
+    val title = when { isAll -> "Tout le monde"; group != null -> group!!.name; else -> contact?.name ?: unknownName ?: "Discussion" }
     val peer = peers.firstOrNull { it.id == chat }
     val subtitle = when {
         isAll -> if (peers.isEmpty()) "Personne à portée pour l'instant" else "${peers.size} téléphone(s) à portée · messages publics"
         group != null -> "${group!!.members.size} membres · ${group!!.members.count { m -> peers.any { it.id == m } }} à portée"
         peer != null && peer.limited -> "Ancienne version de Proximo : il doit se mettre à jour pour recevoir tes messages"
-        peer != null -> if (peer.linked) "Joignable" + (peer.meters?.let { " · $it m" } ?: " · Wi-Fi direct") else "À portée · liaison en attente (téléphone en veille ?)"
+        peer != null -> if (peer.linked) "Joignable" + (peer.meters?.let { " · $it m" } ?: " · Wi-Fi direct") + (if (!wifiLink) (if (can) " · Bluetooth seul avec lui" else " · Bluetooth seul : ni appel ni vidéo") else "") else "À portée · liaison en attente (téléphone en veille ?)"
         else -> "Hors de portée · les messages partiront dès que possible"
     }
 
@@ -124,12 +152,15 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     // (Seulement quand l'écran est vraiment affiché : téléphone en poche avec la discussion restée ouverte, les messages
     //  doivent sonner, notifier et rester « non lus ».)
     val lastMid = messages.lastOrNull()?.mid
-    LaunchedEffect(chat, lastMid) { if (MainActivity.isForeground) withContext(Dispatchers.IO) { db.markRead(chat) } }
+    // (Passe par la messagerie quand elle tourne : elle prévient l'expéditeur que ses messages privés ont été lus.)
+    LaunchedEffect(chat, lastMid) { if (MainActivity.isForeground) withContext(Dispatchers.IO) { svc?.messenger?.markChatRead(chat) ?: db.markRead(chat) } }
     LifecycleResumeEffect(chat, svc) {
         val m = svc?.messenger
         m?.openChat = chat
-        scope.launch(Dispatchers.IO) { db.markRead(chat) }
-        onPauseOrDispose { if (m?.openChat == chat) m.openChat = null }
+        scope.launch(Dispatchers.IO) { m?.markChatRead(chat) ?: db.markRead(chat) }
+        // Le brouillon a pu être envoyé ou changé depuis une autre page de la même discussion.
+        store.draft(chat).let { if (it != text) text = it }
+        onPauseOrDispose { store.setDraft(chat, textNow); if (m?.openChat == chat) m.openChat = null }
     }
     // Aller en bas à chaque nouveau dernier message (y compris au-delà de 500 messages) ; sans animation à l'ouverture.
     var firstScroll by remember(chat) { mutableStateOf(true) }
@@ -138,12 +169,12 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     }
 
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) scope.launch { val b = withContext(Dispatchers.IO) { Photos.compress(ctx, uri) }; if (b != null) svc?.messenger?.sendPhoto(chat, b) }
+        if (uri != null) scope.launch { val b = withContext(Dispatchers.IO) { Photos.compress(ctx, uri, lightMedia()) }; if (b != null) svc?.messenger?.sendPhoto(chat, b) }
     }
     val photoFile = remember { File(ctx.cacheDir, "photo.jpg") }
     val photoUri = remember { FileProvider.getUriForFile(ctx, ctx.packageName + ".files", photoFile) }
     val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
-        if (ok) scope.launch { val b = withContext(Dispatchers.IO) { Photos.compress(ctx, photoUri) }; if (b != null) svc?.messenger?.sendPhoto(chat, b) }
+        if (ok) scope.launch { val b = withContext(Dispatchers.IO) { Photos.compress(ctx, photoUri, lightMedia()) }; if (b != null) svc?.messenger?.sendPhoto(chat, b) }
     }
     val cameraDenied = "Appareil photo refusé : autorise-le dans les réglages Android de Proximo"
     val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) takePhoto.launch(photoUri) else svc?.messenger?.event(cameraDenied) }
@@ -195,11 +226,9 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             }
             if (!isAll) Icon(Icons.Filled.Lock, "Chiffré", tint = Px.Accent, modifier = Modifier.size(18.dp))
             if (!isAll && group == null && contact?.blocked != true) {
-                // Recalculé toutes les 3 s hors du fil d'affichage (il interroge la base), et vérifié pour de bon au toucher.
-                val can by androidx.compose.runtime.produceState(false, svc, chat) {
-                    while (true) { value = withContext(Dispatchers.IO) { svc?.calls?.canCall(chat) == true }; kotlinx.coroutines.delay(3000) }
-                }
-                IconButton(onClick = { if (svc?.calls?.canCall(chat) == true) svc?.calls?.call(chat) else svc?.messenger?.event("Trop loin pour un appel (pas de Wi-Fi direct, même via un voisin) : utilise le talkie-walkie") }) {
+                IconButton(onClick = { if (svc?.calls?.canCall(chat) == true) svc?.calls?.call(chat) else svc?.messenger?.event(
+                    if (peer?.linked == true && !wifiLink) "Appel impossible : la liaison avec $title est en Bluetooth seulement (Wi-Fi direct absent ou éteint sur l'un des deux téléphones). Utilise le talkie-walkie."
+                    else "Trop loin pour un appel (pas de Wi-Fi direct, même via un voisin) : utilise le talkie-walkie") }) {
                     Icon(Icons.Filled.Call, "Appeler", tint = if (can) Px.Accent else Px.Muted)
                 }
             }
@@ -207,9 +236,10 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             Box {
                 IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "Menu", tint = Color.White) }
                 DropdownMenu(menu, { menu = false }) {
-                    if (group != null) DropdownMenuItem(text = { Text("Membres : " + group!!.members.joinToString { m -> names[m] ?: if (m == svc?.core?.myId()) "moi" else "?" }) }, onClick = { menu = false })
+                    if (group != null) DropdownMenuItem(text = { Text("Membres du groupe (${group!!.members.size})") }, onClick = { menu = false; membersDialog = true })
+                    if (!isAll && group == null && contact?.accepted == true) DropdownMenuItem(text = { Text("Tester la liaison") }, onClick = { menu = false; svc?.messenger?.let { m -> Thread { m.testLink(chat) }.start() } })
                     DropdownMenuItem(text = { Text("Effacer la discussion") }, onClick = { menu = false; clearDialog = true })
-                    if (!isAll && group == null && contact != null && contact?.blocked != true) DropdownMenuItem(text = { Text("Bloquer ce contact", color = Px.Danger) }, onClick = { menu = false; blockDialog = true })
+                    if (!isAll && group == null && contact?.blocked != true) DropdownMenuItem(text = { Text(if (contact != null) "Bloquer ce contact" else "Bloquer ce téléphone", color = Px.Danger) }, onClick = { menu = false; blockDialog = true })
                     if (group != null) DropdownMenuItem(text = { Text("Quitter le groupe", color = Px.Danger) }, onClick = { menu = false; leaveDialog = true })
                 }
             }
@@ -220,7 +250,14 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             itemsIndexed(messages, key = { _, m -> m.mid }) { i, m ->
                 val day = dayLabel(m.shownAt)
                 if (i == 0 || dayLabel(messages[i - 1].shownAt) != day) DaySeparator(day)
-                Bubble(m, showName = isAll || group != null, contactName = { id -> names[id] ?: peers.firstOrNull { it.id == id }?.name })
+                Bubble(
+                    m, showName = isAll || group != null, contactName = { id -> names[id] ?: peers.firstOrNull { it.id == id }?.name },
+                    reactions = reactions[m.mid].orEmpty(),
+                    onReply = { replyTo = m },
+                    onReact = { e -> svc?.messenger?.react(chat, m, e) },
+                    // Expéditeur qui n'est pas dans mes contacts (« Tout le monde », groupe, inconnu) : on peut le bloquer d'ici.
+                    onBlock = if (!m.mine && names[m.from] == null) ({ blockSender = m }) else null,
+                )
             }
             if (messages.isEmpty()) item {
                 Text(
@@ -233,6 +270,14 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         }
 
         // ---- barre de saisie ----
+        // ---- réponse en cours ----
+        replyTo?.let { r ->
+            val who = if (r.mine) fr.proximo.app.core.Identity.get(ctx).name else names[r.from] ?: r.senderName.ifBlank { "?" }
+            Row(Modifier.fillMaxWidth().background(Px.Card).padding(start = 14.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(Messenger.quoteLine(who, r), color = Px.AccentSoft, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                IconButton(onClick = { replyTo = null }) { Icon(Icons.Filled.Close, "Annuler la réponse", tint = Px.Muted) }
+            }
+        }
         if (contact?.blocked == true) {
             Row(Modifier.fillMaxWidth().background(Px.Bar).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("${contact?.name} est bloqué : tu ne reçois plus rien de lui.", color = Px.Warn, modifier = Modifier.weight(1f), fontSize = 14.sp)
@@ -285,7 +330,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                         detectTapGestures(onPress = {
                             // Micro pas encore autorisé : on le demande (au lieu d'un « Micro indisponible » sans suite).
                             if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) { askMic.launch(android.Manifest.permission.RECORD_AUDIO); return@detectTapGestures }
-                            if (recorder.start()) {
+                            if (recorder.start(lightMedia())) {
                                 recording = true
                                 try { tryAwaitRelease() } finally { recording = false }
                                 val r = recorder.stop()
@@ -298,7 +343,13 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
             } else RoundButton(Icons.AutoMirrored.Filled.Send, "Envoyer", Px.Accent, Px.Bg) {
                 // Réseau arrêté : le texte reste dans le champ au lieu de disparaître sans partir.
                 val m = svc?.messenger
-                if (m != null) { m.sendText(chat, text); text = "" }
+                if (m != null) {
+                    // Réponse à un message : sa première ligne cite le message (lisible aussi sur une version plus ancienne).
+                    val r = replyTo
+                    val who = if (r == null) "" else if (r.mine) fr.proximo.app.core.Identity.get(ctx).name else names[r.from] ?: r.senderName.ifBlank { "?" }
+                    m.sendText(chat, if (r != null) Messenger.quoteLine(who, r) + "\n" + text.trim() else text)
+                    text = ""; replyTo = null; store.setDraft(chat, "")
+                }
             }
         }
     }
@@ -316,10 +367,60 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     if (blockDialog) {
         AlertDialog(
             onDismissRequest = { blockDialog = false }, containerColor = Px.Card,
-            title = { Text("Bloquer ${contact?.name ?: "ce contact"} ?", color = Color.White) },
+            title = { Text("Bloquer ${contact?.name ?: unknownName ?: "ce téléphone"} ?", color = Color.White) },
             text = { Text("Tu ne recevras plus rien de lui : ni messages, ni appels, ni wizz, ni demandes de contact. Sa discussion sera cachée (les messages sont gardés). Tu pourras le débloquer dans Contacts.", color = Px.Muted) },
-            confirmButton = { TextButton(onClick = { blockDialog = false; val m = svc?.messenger; if (m != null) { Thread { m.blockContact(chat) }.start(); onBack?.invoke() } }) { Text("Bloquer", color = Px.Danger) } },
+            confirmButton = { TextButton(onClick = { blockDialog = false; val m = svc?.messenger; if (m != null) { val nm = contact?.name ?: unknownName ?: "Inconnu"; Thread { m.blockSender(chat, nm) }.start(); onBack?.invoke() } }) { Text("Bloquer", color = Px.Danger) } },
             dismissButton = { TextButton(onClick = { blockDialog = false }) { Text("Annuler", color = Px.Muted) } },
+        )
+    }
+
+    blockSender?.let { bm ->
+        val nm = bm.senderName.ifBlank { "ce téléphone" }
+        AlertDialog(
+            onDismissRequest = { blockSender = null }, containerColor = Px.Card,
+            title = { Text("Bloquer $nm ?", color = Color.White) },
+            text = { Text("Tu ne verras plus ses messages, ni ici ni ailleurs, et il ne pourra plus te joindre (messages, SOS, appels, demandes de contact). Tu pourras le débloquer dans Contacts.", color = Px.Muted) },
+            confirmButton = { TextButton(onClick = { blockSender = null; val m = svc?.messenger; if (m != null) Thread { m.blockSender(bm.from, bm.senderName) }.start() }) { Text("Bloquer", color = Px.Danger) } },
+            dismissButton = { TextButton(onClick = { blockSender = null }) { Text("Annuler", color = Px.Muted) } },
+        )
+    }
+
+    removeMember?.let { id ->
+        AlertDialog(
+            onDismissRequest = { removeMember = null }, containerColor = Px.Card,
+            title = { Text("Retirer ${names[id] ?: "ce membre"} du groupe ?", color = Color.White) },
+            text = { Text("Il sera prévenu, le groupe disparaîtra de son téléphone avec ses messages, et il ne pourra plus lire la suite. Tu pourras le rajouter plus tard.", color = Px.Muted) },
+            confirmButton = { TextButton(onClick = { removeMember = null; val m = svc?.messenger; if (m != null) Thread { m.removeFromGroup(chat, id) }.start() }) { Text("Retirer", color = Px.Danger) } },
+            dismissButton = { TextButton(onClick = { removeMember = null }) { Text("Annuler", color = Px.Muted) } },
+        )
+    }
+
+    if (membersDialog) group?.let { g ->
+        val myId = svc?.core?.myId()
+        val owner = g.owner == myId
+        AlertDialog(
+            onDismissRequest = { membersDialog = false }, containerColor = Px.Card,
+            title = { Text("Membres du groupe", color = Color.White) },
+            text = {
+                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                    for (id in g.members) Row(Modifier.fillMaxWidth().heightIn(min = 44.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text((if (id == myId) "Moi" else names[id] ?: "Inconnu") + (if (id == g.owner) " · créateur" else ""), color = Color.White, modifier = Modifier.weight(1f))
+                        if (owner && id != myId) IconButton(onClick = { removeMember = id }) { Icon(Icons.Filled.Close, "Retirer du groupe", tint = Px.Danger) }
+                    }
+                    if (owner) {
+                        val addable = accepted.filter { it.id !in g.members }
+                        Spacer(Modifier.height(10.dp))
+                        Text(if (addable.isEmpty()) "Tous tes contacts sont déjà dans le groupe." else "Ajouter un contact", color = Px.AccentSoft, fontSize = 13.sp)
+                        for (c in addable) Row(Modifier.fillMaxWidth().heightIn(min = 44.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(c.name, color = Color.White, modifier = Modifier.weight(1f))
+                            TextButton(onClick = { val m = svc?.messenger; if (m != null) Thread { m.addToGroup(chat, listOf(c.id)) }.start() }) { Text("Ajouter") }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text("Retirer quelqu'un change la clé du groupe : il ne peut plus lire la suite.", color = Px.Muted, fontSize = 12.sp)
+                    } else Text("Seul le créateur du groupe peut ajouter ou retirer des membres.", color = Px.Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
+                }
+            },
+            confirmButton = { TextButton(onClick = { membersDialog = false }) { Text("Fermer") } },
         )
     }
 
@@ -363,7 +464,7 @@ private fun DaySeparator(day: String) {
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> String?) {
+private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> String?, reactions: List<String> = emptyList(), onReply: () -> Unit = {}, onReact: (String) -> Unit = {}, onBlock: (() -> Unit)? = null) {
     val ctx = LocalContext.current
     if (m.kind == Message.SYS) { Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) { Text(m.body, color = Px.Muted, fontSize = 12.sp) }; return }
     val isSos = m.kind == Message.SOS
@@ -374,6 +475,9 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
     if (details) MessageDetails(m, contactName) { details = false }
     Box(Modifier.fillMaxWidth().padding(vertical = 3.dp), contentAlignment = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart) {
         DropdownMenu(menu, { menu = false }) {
+            // Réactions rapides, puis répondre en citant le message.
+            Row(Modifier.padding(horizontal = 8.dp)) { for (e in REACTIONS) Text(e, fontSize = 24.sp, modifier = Modifier.clickable { menu = false; onReact(e) }.padding(8.dp)) }
+            DropdownMenuItem(text = { Text("Répondre") }, onClick = { menu = false; onReply() })
             DropdownMenuItem(text = { Text("Détails") }, onClick = { menu = false; details = true })
             if (m.kind == Message.TEXT) DropdownMenuItem(text = { Text("Copier le texte") }, onClick = {
                 menu = false
@@ -381,6 +485,7 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                 MeshService.instance?.messenger?.event("Texte copié")
             })
             if (m.mine && m.status == Message.FAILED) DropdownMenuItem(text = { Text("Renvoyer") }, onClick = { menu = false; MeshService.instance?.messenger?.resend(m.mid) })
+            if (onBlock != null) DropdownMenuItem(text = { Text("Bloquer cet expéditeur", color = Px.Danger) }, onClick = { menu = false; onBlock() })
             DropdownMenuItem(text = { Text("Supprimer", color = Px.Danger) }, onClick = { menu = false; Thread { Db.get(ctx).deleteMessage(m.mid) }.start() })
         }
         Column(Modifier.widthIn(max = 300.dp).background(bg, shape).combinedClickable(onClick = {}, onLongClick = { menu = true }).padding(12.dp, 8.dp)) {
@@ -420,14 +525,28 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                     Text(if (m.mine) "👋 Wizz envoyé" else "👋 Wizz !", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     if (!m.mine && m.received - m.time > fr.proximo.app.msg.Messenger.WIZZ_FRESH_MS) Text("Arrivé en retard : n'a pas sonné", color = Px.Warn, fontSize = 11.sp)
                 }
-                else -> Text(m.body, color = Color.White, fontSize = 15.sp)
+                else -> {
+                    // Réponse à un autre message : la ligne citée s'affiche dans un encadré, au-dessus du texte.
+                    val q = Messenger.splitQuote(m.body)
+                    if (q != null) {
+                        Text(q.first, color = Color.White.copy(alpha = 0.75f), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.background(Color.Black.copy(alpha = 0.22f), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 4.dp))
+                        Spacer(Modifier.height(4.dp))
+                        Text(q.second, color = Color.White, fontSize = 15.sp)
+                    } else Text(m.body, color = Color.White, fontSize = 15.sp)
+                }
             }
+            if (reactions.isNotEmpty()) Text(
+                reactions.groupingBy { it }.eachCount().entries.joinToString("  ") { (e, n) -> if (n > 1) "$e $n" else e },
+                fontSize = 14.sp, modifier = Modifier.padding(top = 3.dp).background(Color.Black.copy(alpha = 0.22f), RoundedCornerShape(10.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
+            )
             if (m.late) Text("Reçu ${stamp(m.received).lowercase()} · écrit ${stamp(m.time).lowercase()}", color = Px.Warn, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
             Row(Modifier.fillMaxWidth().combinedClickable(onLongClick = { menu = true }) { details = true }, horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                 Text(stamp(m.time), color = if (m.mine) Px.AccentSoft else Px.Muted, fontSize = 11.sp)
                 if (m.mine) {
                     Spacer(Modifier.width(6.dp))
                     val (label, color) = when (m.status) {
+                        Message.READ -> "✓✓ Lu" to Px.Accent
                         Message.DELIVERED -> "✓✓ " + (m.route.ifEmpty { "Reçu" }) to Px.AccentSoft
                         Message.RELAYED -> "✓ " + (m.route.ifEmpty { "Relayé" }) to Px.Warn
                         Message.FAILED -> "Échec · appui long pour renvoyer" to Px.Danger
@@ -469,7 +588,7 @@ private fun MessageDetails(m: Message, contactName: (String) -> String?, onClose
         add("Écrit : " + fullStamp(m.time))
         if (!m.mine && m.received > 0) add("Reçu : " + fullStamp(m.received) + if (m.late) "  (en retard)" else "")
         if (!m.mine) add("De : " + (contactName(m.from) ?: m.senderName.ifEmpty { "Inconnu" }))
-        add("Chemin : " + m.route.ifEmpty { if (m.mine) when (m.status) { Message.DELIVERED -> "reçu"; Message.RELAYED -> "relayé"; Message.FAILED -> "échec"; else -> "en attente" } else "direct" })
+        add("Chemin : " + m.route.ifEmpty { if (m.mine) when (m.status) { Message.READ -> "lu"; Message.DELIVERED -> "reçu"; Message.RELAYED -> "relayé"; Message.FAILED -> "échec"; else -> "en attente" } else "direct" })
         add("Type : " + when (m.kind) { Message.PHOTO -> "photo"; Message.VOICE -> "vocal (${m.body} s)"; Message.VIDEO -> "vidéo (${m.body} s)"; Message.LOC -> "position"; Message.SOS -> "SOS"; Message.WIZZ -> "wizz"; else -> "texte" })
         m.file?.let { f -> val size = File(f).length(); if (size > 0) add("Taille : " + if (size > 1_000_000) "${size / 1_000_000} Mo" else "${size / 1000} Ko") }
     }
@@ -499,3 +618,6 @@ private fun VoiceRow(m: Message) {
         Text("Vocal · ${m.body} s", color = Color.White, fontSize = 14.sp)
     }
 }
+
+/** Réactions rapides proposées dans le menu d'un message. */
+private val REACTIONS = listOf("👍", "❤️", "😂", "😮", "🙏")

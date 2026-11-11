@@ -15,9 +15,12 @@ import java.io.File
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
-/** Réduction d'une photo pour le réseau : au plus 1024 px et environ 200 Ko. */
+/**
+ * Réduction d'une photo pour le réseau : au plus 1024 px et environ 200 Ko.
+ * light = liaison en Bluetooth seulement : 800 px et environ 80 Ko, pour qu'elle parte en quelques secondes.
+ */
 object Photos {
-    fun compress(ctx: Context, uri: Uri): ByteArray? = try {
+    fun compress(ctx: Context, uri: Uri, light: Boolean = false): ByteArray? = try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         var sample = 1
@@ -26,14 +29,15 @@ object Photos {
         var bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
         val rotation = try { ctx.contentResolver.openInputStream(uri)?.use { ExifInterface(it).rotationDegrees } ?: 0 } catch (e: Exception) { 0 }
         if (rotation != 0) bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(rotation.toFloat()) }, true)
-        val maxSide = 1024f
+        val maxSide = if (light) 800f else 1024f
         val scale = minOf(1f, maxSide / maxOf(bmp.width, bmp.height))
         if (scale < 1f) bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
-        var quality = 70
+        var quality = if (light) 60 else 70
+        val target = if (light) 80_000 else 200_000
         var out: ByteArray
         do {
             val bos = ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.JPEG, quality, bos); out = bos.toByteArray(); quality -= 10
-        } while (out.size > 200_000 && quality >= 30)
+        } while (out.size > target && quality >= 30)
         out
     } catch (e: Exception) { null }
 }
@@ -81,13 +85,14 @@ class VoiceRecorder(private val ctx: Context) {
     private var file: File? = null
     private var start = 0L
 
-    fun start(): Boolean = try {
+    /** light = liaison en Bluetooth seulement : son un peu plus compressé (un vocal d'une minute pèse environ 100 Ko au lieu de 180). */
+    fun start(light: Boolean = false): Boolean = try {
         val f = File(ctx.cacheDir, "vocal.m4a"); f.delete()
         val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(ctx) else MediaRecorder()
         r.setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
         r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
         r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-        r.setAudioSamplingRate(16000); r.setAudioEncodingBitRate(24000); r.setAudioChannels(1)
+        r.setAudioSamplingRate(16000); r.setAudioEncodingBitRate(if (light) 14000 else 24000); r.setAudioChannels(1)
         r.setMaxDuration(60_000)
         r.setOutputFile(f.absolutePath)
         r.prepare(); r.start()

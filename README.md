@@ -4,7 +4,7 @@ Messagerie Android **sans Internet** : les téléphones se parlent directement e
 
 Conçu et développé par **Ismail Ersevik**.
 
-## Ce que fait l'appli (version 1.5.0, APK 18)
+## Ce que fait l'appli (version 1.6.0, APK 19)
 
 - **Radar** : les téléphones Proximo à portée, avec distance approximative, ceux déjà en contact et les inconnus (« ? »).
 - **Contacts** : ajout depuis le radar, par QR code ou par code `PRX-XXXX-XXXX` (l'ajout se fait dès que les deux téléphones sont à portée).
@@ -16,6 +16,11 @@ Conçu et développé par **Ismail Ersevik**.
 - **Position** : coordonnées, distance et direction affichées sous une position ou un SOS reçu (sans carte ni Internet).
 - **SOS prioritaire** : il passe devant tout ce qui attend d'être envoyé. « Appel manqué » noté dans la discussion. « Renvoyer » sur un message en échec.
 - **Inventaire** : à l'ouverture d'une liaison, les téléphones se disent ce qu'ils ont déjà pour ne pas se le renvoyer.
+- **Répondre** à un message précis, **réactions** (👍 ❤️ 😂 😮 🙏), accusé **« Lu »** en discussion privée (désactivable), brouillon gardé par discussion.
+- **Test de liaison** vers un contact : chemin emprunté (direct ou via combien de relais) et temps d'aller-retour.
+- **Relais fixe** : un téléphone laissé branché relaie à portée maximale, sans sonner ni notifier.
+- **Bluetooth seul** : indiqué dans la discussion ; photos et vocaux plus légers quand il n'y a pas de Wi-Fi direct.
+- **Groupes modifiables** : le créateur ajoute ou retire des membres (le retrait change la clé du groupe).
 - **Groupes** (clé de groupe partagée) et canal **« Tout le monde »** (public, à portée).
 - **Appels vocaux** (bêta) chiffrés de bout en bout, en Wi-Fi direct, en direct ou via un voisin relais (2 sauts).
 - **Vidéos courtes** (15 s, 3,5 Mo max), uniquement par Wi-Fi direct, un relais au maximum.

@@ -66,6 +66,8 @@ class Frame(
         const val AVATAR = 14        // ma photo de profil (direct uniquement)
         const val INV = 15           // inventaire à l'ouverture d'une liaison : « as-tu déjà ces messages ? » (direct uniquement)
 
+        const val ECHO = 17          // test de liaison : aller-retour vers un contact (relayable)
+        const val READ = 18          // accusé de lecture « Lu », signé par le destinataire (relayable)
         const val AUTH = 16          // preuve d'identité à l'ouverture d'une liaison (direct uniquement, traitée par les transports)
 
         val DIRECT_ONLY = setOf(HELLO, CARD_REQ, CARD, CALL, APK, PING, AVATAR, INV, AUTH)

@@ -347,8 +347,11 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         }
         // Dédoublonnage : une trame pour moi que je n'ai pas pu traiter (clé pas encore reçue) est mise de côté et rejouée plus tard.
         if (f.relayable) {
-            recentSeen[fid] = now; db.markSeen(fid)
-            if (forMe && !handled) db.saveHeld(fid, f.encode(), f.fromHex, fromPeer, if (heldSince > 0) heldSince else now)
+            // Demande de contact non signée (version 1.5.0) arrivée par un relais : refusée, mais pas notée « déjà vue »,
+            // pour que la même trame soit acceptée quand elle arrivera en direct de son auteur.
+            val retryDirect = forMe && !handled && (f.type == Frame.CONTACT_REQ || f.type == Frame.CONTACT_ACCEPT)
+            if (!retryDirect) { recentSeen[fid] = now; db.markSeen(fid) }
+            if (forMe && !handled && !retryDirect) db.saveHeld(fid, f.encode(), f.fromHex, fromPeer, if (heldSince > 0) heldSince else now)
         }
         if (replay) return
         // Un accusé de réception vide les files d'attente des relais — seulement s'il est signé par le destinataire du message
@@ -376,7 +379,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             db.markSeen(fid)
             if (f.relayable) {
                 // Les trames « techniques » (accusés, demandes de contact) sont retirées dès qu'elles sont remises au destinataire.
-                val technical = f.type == Frame.ACK || f.type == Frame.CONTACT_REQ || f.type == Frame.CONTACT_ACCEPT
+                val technical = f.type == Frame.ACK || f.type == Frame.CONTACT_REQ || f.type == Frame.CONTACT_ACCEPT || f.type == Frame.ECHO || f.type == Frame.READ
                 val o = Outbox(fid, f.encode(), f.toHex, System.currentTimeMillis(), HashSet(), mine = !technical)
                 lock.withLock { db.saveOutbox(o) }
                 flush()
@@ -430,6 +433,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             // (Ces délais s'appliquent aussi quand personne n'est à portée.)
             val keep = when { o.size > 1_000_000 -> 24 * 3600_000L; o.size > 50_000 -> 3 * 24 * 3600_000L; else -> 14 * 24 * 3600_000L }
             if (!o.mine && now - o.created > keep) { db.removeOutbox(o.fid); continue }
+            // Un test de liaison n'a de sens que tout de suite : il ne traîne pas dans les files d'attente.
+            if (o.type == Frame.ECHO && now - o.created > 60_000) { db.removeOutbox(o.fid); continue }
             if (connected.isEmpty()) continue
             val isDirect = o.dest != broadcast
             var changed = false
