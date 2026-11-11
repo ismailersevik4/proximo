@@ -105,6 +105,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     var sosDialog by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
     var leaveDialog by remember { mutableStateOf(false) }
+    var blockDialog by remember { mutableStateOf(false) }
     val recorder = remember { VoiceRecorder(ctx) }
     // L'écran change pendant un enregistrement (appel entrant…) : le micro est toujours libéré.
     DisposableEffect(Unit) { onDispose { recorder.cancel() } }
@@ -192,7 +193,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                 Text(subtitle, color = if (peer != null || isAll || group != null) Px.AccentSoft else Px.Muted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
             if (!isAll) Icon(Icons.Filled.Lock, "Chiffré", tint = Px.Accent, modifier = Modifier.size(18.dp))
-            if (!isAll && group == null) {
+            if (!isAll && group == null && contact?.blocked != true) {
                 // Recalculé toutes les 3 s hors du fil d'affichage (il interroge la base), et vérifié pour de bon au toucher.
                 val can by androidx.compose.runtime.produceState(false, svc, chat) {
                     while (true) { value = withContext(Dispatchers.IO) { svc?.calls?.canCall(chat) == true }; kotlinx.coroutines.delay(3000) }
@@ -207,6 +208,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
                 DropdownMenu(menu, { menu = false }) {
                     if (group != null) DropdownMenuItem(text = { Text("Membres : " + group!!.members.joinToString { m -> names[m] ?: if (m == svc?.core?.myId()) "moi" else "?" }) }, onClick = { menu = false })
                     DropdownMenuItem(text = { Text("Effacer la discussion") }, onClick = { menu = false; clearDialog = true })
+                    if (!isAll && group == null && contact != null && contact?.blocked != true) DropdownMenuItem(text = { Text("Bloquer ce contact", color = Px.Danger) }, onClick = { menu = false; blockDialog = true })
                     if (group != null) DropdownMenuItem(text = { Text("Quitter le groupe", color = Px.Danger) }, onClick = { menu = false; leaveDialog = true })
                 }
             }
@@ -230,7 +232,12 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         }
 
         // ---- barre de saisie ----
-        if (contact?.status == 0) {
+        if (contact?.blocked == true) {
+            Row(Modifier.fillMaxWidth().background(Px.Bar).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("${contact?.name} est bloqué : tu ne reçois plus rien de lui.", color = Px.Warn, modifier = Modifier.weight(1f), fontSize = 14.sp)
+                TextButton(onClick = { val m = svc?.messenger; if (m != null) Thread { m.unblockContact(chat) }.start() }) { Text("Débloquer") }
+            }
+        } else if (contact?.status == 0) {
             Text("En attente de l'acceptation de ${contact?.name}…", color = Px.Warn, modifier = Modifier.fillMaxWidth().background(Px.Bar).padding(16.dp), fontSize = 14.sp)
         } else if (contact?.status == 2) {
             Row(Modifier.fillMaxWidth().background(Px.Bar).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -305,6 +312,16 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
         )
     }
 
+    if (blockDialog) {
+        AlertDialog(
+            onDismissRequest = { blockDialog = false }, containerColor = Px.Card,
+            title = { Text("Bloquer ${contact?.name ?: "ce contact"} ?", color = Color.White) },
+            text = { Text("Tu ne recevras plus rien de lui : ni messages, ni appels, ni wizz, ni demandes de contact. Sa discussion sera cachée (les messages sont gardés). Tu pourras le débloquer dans Contacts.", color = Px.Muted) },
+            confirmButton = { TextButton(onClick = { blockDialog = false; val m = svc?.messenger; if (m != null) { Thread { m.blockContact(chat) }.start(); onBack?.invoke() } }) { Text("Bloquer", color = Px.Danger) } },
+            dismissButton = { TextButton(onClick = { blockDialog = false }) { Text("Annuler", color = Px.Muted) } },
+        )
+    }
+
     if (leaveDialog) {
         AlertDialog(
             onDismissRequest = { leaveDialog = false }, containerColor = Px.Card,
@@ -362,6 +379,7 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                 (ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("Proximo", m.body))
                 MeshService.instance?.messenger?.event("Texte copié")
             })
+            if (m.mine && m.status == Message.FAILED) DropdownMenuItem(text = { Text("Renvoyer") }, onClick = { menu = false; MeshService.instance?.messenger?.resend(m.mid) })
             DropdownMenuItem(text = { Text("Supprimer", color = Px.Danger) }, onClick = { menu = false; Thread { Db.get(ctx).deleteMessage(m.mid) }.start() })
         }
         Column(Modifier.widthIn(max = 300.dp).background(bg, shape).combinedClickable(onClick = {}, onLongClick = { menu = true }).padding(12.dp, 8.dp)) {
@@ -388,11 +406,14 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.combinedClickable(onLongClick = { menu = true }) {
                         if (parts.size == 2) openSafely(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("geo:${parts[0]},${parts[1]}?q=${parts[0]},${parts[1]}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }) { Icon(Icons.Filled.Place, null, tint = Px.Accent); Spacer(Modifier.width(6.dp)); Text("Position partagée\nOuvrir dans Maps", color = Color.White, fontSize = 14.sp) }
+                    val la = parts.getOrNull(0)?.toDoubleOrNull(); val lo = parts.getOrNull(1)?.toDoubleOrNull()
+                    if (!m.mine && parts.size == 2 && la != null && lo != null && okPos(la, lo)) PositionInfo(la, lo)
                 }
                 Message.SOS -> {
                     val o = Db.jsonObj(m.body)
                     Text("🆘 SOS : " + o.optString("t", m.body), color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     if (o.has("lat")) Text("Voir la position", color = Px.Accent, fontSize = 14.sp, modifier = Modifier.clickable { openSafely(ctx, Intent(Intent.ACTION_VIEW, Uri.parse("geo:${o.optDouble("lat")},${o.optDouble("lon")}?q=${o.optDouble("lat")},${o.optDouble("lon")}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) })
+                    if (!m.mine && o.has("lat") && o.has("lon") && okPos(o.optDouble("lat"), o.optDouble("lon"))) PositionInfo(o.optDouble("lat"), o.optDouble("lon"))
                 }
                 Message.WIZZ -> {
                     Text(if (m.mine) "👋 Wizz envoyé" else "👋 Wizz !", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
@@ -408,13 +429,36 @@ private fun Bubble(m: Message, showName: Boolean, contactName: (String) -> Strin
                     val (label, color) = when (m.status) {
                         Message.DELIVERED -> "✓✓ " + (m.route.ifEmpty { "Reçu" }) to Px.AccentSoft
                         Message.RELAYED -> "✓ " + (m.route.ifEmpty { "Relayé" }) to Px.Warn
-                        Message.FAILED -> "Échec" to Px.Danger
+                        Message.FAILED -> "Échec · appui long pour renvoyer" to Px.Danger
                         else -> "⏳ En attente" to Px.Warn
                     }
                     Text(label, color = color, fontSize = 11.sp)
                 } else if (m.route.isNotEmpty() && m.route != "direct") { Spacer(Modifier.width(6.dp)); Text("· ${m.route}", color = Px.Muted, fontSize = 11.sp) }
             }
         }
+    }
+}
+
+/** Coordonnées plausibles (faux pour NaN, l'infini ou hors de la Terre). */
+private fun okPos(la: Double, lo: Double) = la in -90.0..90.0 && lo in -180.0..180.0
+
+/**
+ * Sous une position reçue : les coordonnées (utiles sans carte ni Internet), puis la distance et la direction
+ * depuis la dernière position connue de ce téléphone.
+ */
+@Composable
+private fun PositionInfo(lat: Double, lon: Double) {
+    val ctx = LocalContext.current
+    val mine by androidx.compose.runtime.produceState<android.location.Location?>(null, lat, lon) { value = withContext(Dispatchers.IO) { Locations.lastKnown(ctx) } }
+    Text("%.5f, %.5f".format(java.util.Locale.US, lat, lon), color = Px.Muted, fontSize = 12.sp)
+    val me = mine
+    if (me == null) Text("Distance inconnue : la position de ce téléphone n'est pas disponible", color = Px.Muted, fontSize = 12.sp)
+    else {
+        val res = FloatArray(2)
+        android.location.Location.distanceBetween(me.latitude, me.longitude, lat, lon, res)
+        val ageMin = (System.currentTimeMillis() - me.time) / 60_000
+        val age = when { ageMin < 5 -> ""; ageMin < 90 -> " (d'après ta position d'il y a $ageMin min)"; ageMin < 48 * 60 -> " (d'après ta position d'il y a ${ageMin / 60} h)"; else -> " (d'après ta position d'il y a ${ageMin / 1440} jours)" }
+        Text("À ${Locations.distanceText(res[0])} · direction ${Locations.compassText(res[1])}$age", color = if (ageMin < 90) Px.AccentSoft else Px.Warn, fontSize = 12.sp)
     }
 }
 

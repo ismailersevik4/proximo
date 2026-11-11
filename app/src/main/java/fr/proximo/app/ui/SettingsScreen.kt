@@ -48,7 +48,7 @@ fun SettingsScreen(onBack: () -> Unit) {
             Section("Mode de connexion") {
                 ModeRow("Normal", "Recherche Bluetooth équilibrée, Wi-Fi direct actif. Bon compromis portée / batterie.", settings.mode == Modes.NORMAL) { settings.mode = Modes.NORMAL; svc?.updateMode(Modes.NORMAL) }
                 ModeRow("Priorité portée", "Recherche Bluetooth rapide : les voisins apparaissent et se reconnectent plus vite. Consomme plus.", settings.mode == Modes.PORTEE) { settings.mode = Modes.PORTEE; svc?.updateMode(Modes.PORTEE) }
-                ModeRow("Priorité batterie", "Recherche Bluetooth lente et entretien Wi-Fi moins fréquent. Les voisins mettent plus de temps à apparaître.", settings.mode == Modes.BATTERIE) { settings.mode = Modes.BATTERIE; svc?.updateMode(Modes.BATTERIE) }
+                ModeRow("Priorité batterie", "Recherche Bluetooth lente et entretien Wi-Fi moins fréquent, et (Android 12 et plus) le téléphone peut dormir quand personne n'est à portée. Les voisins mettent plus de temps à apparaître.", settings.mode == Modes.BATTERIE) { settings.mode = Modes.BATTERIE; svc?.updateMode(Modes.BATTERIE) }
             }
             Spacer(Modifier.height(14.dp))
             Section("Messages") {

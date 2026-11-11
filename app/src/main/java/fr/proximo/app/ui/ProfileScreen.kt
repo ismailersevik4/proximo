@@ -62,7 +62,7 @@ fun ProfileScreen(onContacts: () -> Unit, onSettings: () -> Unit) {
     var editing by remember { mutableStateOf(false) }
     val qr by androidx.compose.runtime.produceState<Bitmap?>(null, name) { value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { qrBitmap(me.card().toQr()) } }
     val svc by serviceState()
-    val pending by dbState(0) { it.contacts().count { c -> c.status == 2 } }
+    val pending by dbState(0) { it.contacts().count { c -> c.status == 2 && !c.blocked } }
     val nbContacts by dbState(0) { it.acceptedContacts().size }
     val settings = remember { Settings.get(ctx) }
     val tick by settings.changes.collectAsState()

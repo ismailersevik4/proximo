@@ -22,6 +22,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.AlertDialog
@@ -100,13 +101,14 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                 }
                 Spacer(Modifier.height(16.dp))
             }
-            val incoming = contacts.filter { it.status == 2 }
+            val incoming = contacts.filter { it.status == 2 && !it.blocked }
             if (incoming.isNotEmpty()) {
                 item { Text("Demandes reçues", color = Px.Accent, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 6.dp)) }
                 items(incoming, key = { "in" + it.id }) { c ->
                     Row(Modifier.fillMaxWidth().background(Px.Card, RoundedCornerShape(14.dp)).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Avatar(c.name, 44.dp, id = c.id); Spacer(Modifier.width(12.dp))
                         Text(c.name, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        IconButton(onClick = { val m = svc?.messenger; if (m != null) Thread { m.blockContact(c.id) }.start() }) { Icon(Icons.Filled.Block, "Bloquer : il ne pourra plus redemander", tint = Px.Danger) }
                         IconButton(onClick = { svc?.messenger?.refuseContact(c.id) }) { Icon(Icons.Filled.Close, "Refuser", tint = Px.Muted) }
                         IconButton(onClick = { svc?.messenger?.acceptContact(c.id) }) { Icon(Icons.Filled.Check, "Accepter", tint = Px.Accent) }
                     }
@@ -114,7 +116,7 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                 }
                 item { Spacer(Modifier.height(10.dp)) }
             }
-            val outgoing = contacts.filter { it.status == 0 }
+            val outgoing = contacts.filter { it.status == 0 && !it.blocked }
             if (outgoing.isNotEmpty()) {
                 item { Text("Demandes envoyées", color = Px.Muted, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 6.dp)) }
                 items(outgoing, key = { "out" + it.id }) { c ->
@@ -140,6 +142,17 @@ fun ContactsScreen(onBack: () -> Unit, onOpenChat: (String) -> Unit) {
                 }
             }
             if (accepted.isEmpty()) item { Text("Aucun contact pour l'instant. Les téléphones à portée sont sur le radar.", color = Px.Muted, fontSize = 13.sp) }
+            val blocked = contacts.filter { it.blocked }
+            if (blocked.isNotEmpty()) {
+                item { Spacer(Modifier.height(16.dp)); Text("Bloqués (${blocked.size})", color = Px.Danger, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 6.dp)) }
+                items(blocked, key = { "blk" + it.id }) { c ->
+                    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Avatar(c.name, 40.dp, id = c.id); Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) { Text(c.name, color = Color.White); Text("Rien de lui n'arrive sur ce téléphone", color = Px.Muted, fontSize = 12.sp) }
+                        TextButton(onClick = { val m = svc?.messenger; if (m != null) Thread { m.unblockContact(c.id) }.start() }) { Text("Débloquer") }
+                    }
+                }
+            }
         }
     }
 

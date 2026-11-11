@@ -11,8 +11,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Un contact (téléphone ajouté). status : 1 = accepté, 2 = demande reçue en attente, 0 = demande envoyée. */
-data class Contact(val id: String, val name: String, val dhPub: ByteArray, val sigPub: ByteArray, val status: Int, val added: Long, val lastSeen: Long) {
-    val accepted get() = status == 1
+data class Contact(val id: String, val name: String, val dhPub: ByteArray, val sigPub: ByteArray, val status: Int, val added: Long, val lastSeen: Long,
+    /** Contact bloqué : plus rien de lui n'arrive (messages, demandes, appels, wizz) et sa discussion est cachée. */
+    val blocked: Boolean = false) {
+    /** En contact ET pas bloqué : tout ce qui demande « un contact accepté » refuse donc un contact bloqué. */
+    val accepted get() = status == 1 && !blocked
 }
 
 data class Group(val id: String, val name: String, val key: ByteArray, val owner: String, val members: List<String>, val created: Long)
@@ -41,9 +44,11 @@ data class ChatSummary(val chat: String, val name: String, val last: Message?, v
 /** Trame rangée en attente (pas encore remise ou à relayer plus tard). */
 data class Outbox(val fid: String, val data: ByteArray, val dest: String, val created: Long, val sentTo: MutableSet<String>, val mine: Boolean,
     /** Taille du contenu sur le disque (la liste de la file ne charge pas le contenu : voir Db.outboxData). */
-    val size: Long = data.size.toLong())
+    val size: Long = data.size.toLong(),
+    /** Type de la trame (Frame.SOS, Frame.DM…), 0 si inconnu : les SOS passent en tête de file. */
+    val type: Int = if (data.size > 3) data[3].toInt() and 0xff else 0)
 
-class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 5) {
+class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db", null, 6) {
     /** Les gros contenus (file d'attente, trames mises de côté) sont en fichiers : SQLite refuse les lignes de plus de 2 Mo. */
     private val outboxDir = java.io.File(ctx.filesDir, "outbox").also { it.mkdirs() }
     private val heldDir = java.io.File(ctx.filesDir, "held").also { it.mkdirs() }
@@ -52,13 +57,13 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     private fun bump() { changes.update { it + 1 } }
 
     override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE contacts(id TEXT PRIMARY KEY, name TEXT, dh BLOB, sg BLOB, status INTEGER, added INTEGER, last_seen INTEGER)")
+        db.execSQL("CREATE TABLE contacts(id TEXT PRIMARY KEY, name TEXT, dh BLOB, sg BLOB, status INTEGER, added INTEGER, last_seen INTEGER, blocked INTEGER DEFAULT 0)")
         db.execSQL("CREATE TABLE pending_codes(code TEXT PRIMARY KEY, added INTEGER)")
         db.execSQL("CREATE TABLE groups(id TEXT PRIMARY KEY, name TEXT, key BLOB, owner TEXT, members TEXT, created INTEGER)")
         db.execSQL("CREATE TABLE messages(mid TEXT PRIMARY KEY, chat TEXT, from_id TEXT, mine INTEGER, kind TEXT, body TEXT, file TEXT, time INTEGER, status INTEGER, read INTEGER, route TEXT, sender_name TEXT DEFAULT '', received INTEGER DEFAULT 0)")
         db.execSQL("CREATE INDEX idx_msg_chat ON messages(chat, time)")
         db.execSQL("CREATE TABLE seen(fid TEXT PRIMARY KEY, t INTEGER)")
-        db.execSQL("CREATE TABLE outbox(fid TEXT PRIMARY KEY, data BLOB, dest TEXT, created INTEGER, sent_to TEXT, mine INTEGER)")
+        db.execSQL("CREATE TABLE outbox(fid TEXT PRIMARY KEY, data BLOB, dest TEXT, created INTEGER, sent_to TEXT, mine INTEGER, type INTEGER DEFAULT 0)")
         db.execSQL("CREATE TABLE held(fid TEXT PRIMARY KEY, from_id TEXT, peer TEXT, t INTEGER)")
         db.execSQL("CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT)")
         db.execSQL("CREATE TABLE acked(fid TEXT PRIMARY KEY, t INTEGER)")
@@ -77,13 +82,37 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_msg_arrival ON messages(chat, $ARRIVAL)")
             db.execSQL("DELETE FROM messages WHERE kind='ginv'")
         }
+        if (o < 6) {
+            // Contacts bloqués, et type des trames en attente (pour faire passer les SOS en premier).
+            db.execSQL("ALTER TABLE contacts ADD COLUMN blocked INTEGER DEFAULT 0")
+            db.execSQL("ALTER TABLE outbox ADD COLUMN type INTEGER DEFAULT 0")
+            // Les trames déjà en attente reçoivent leur type (lu dans leur fichier) : un SOS en file avant la mise à jour passe en tête lui aussi.
+            try {
+                db.rawQuery("SELECT fid FROM outbox", null).use { c ->
+                    while (c.moveToNext()) try {
+                        val fid = c.getString(0)
+                        java.io.File(outboxDir, "$fid.bin").inputStream().use { s ->
+                            val h = ByteArray(4)
+                            if (s.read(h) == 4) db.execSQL("UPDATE outbox SET type=? WHERE fid=?", arrayOf<Any>(h[3].toInt() and 0xff, fid))
+                        }
+                    } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+        }
     }
 
     // ---------- contacts ----------
-    fun contacts(): List<Contact> = q("SELECT * FROM contacts ORDER BY name COLLATE NOCASE") { readContact(it) }
-    fun contact(id: String): Contact? = q("SELECT * FROM contacts WHERE id=?", id) { readContact(it) }.firstOrNull()
+    fun contacts(): List<Contact> = q("SELECT $CONTACT_COLS FROM contacts ORDER BY name COLLATE NOCASE") { readContact(it) }
+    fun contact(id: String): Contact? = q("SELECT $CONTACT_COLS FROM contacts WHERE id=?", id) { readContact(it) }.firstOrNull()
     fun acceptedContacts(): List<Contact> = contacts().filter { it.accepted }
-    private fun readContact(c: Cursor) = Contact(c.getString(0), c.getString(1), c.getBlob(2), c.getBlob(3), c.getInt(4), c.getLong(5), c.getLong(6))
+    private fun readContact(c: Cursor) = Contact(c.getString(0), c.getString(1), c.getBlob(2), c.getBlob(3), c.getInt(4), c.getLong(5), c.getLong(6), c.getInt(7) == 1)
+
+    /** Bloquer : sa discussion est marquée lue et cachée, plus rien de lui n'arrive. Débloquer : tout redevient comme avant. */
+    fun setBlocked(id: String, blocked: Boolean) {
+        writableDatabase.execSQL("UPDATE contacts SET blocked=? WHERE id=?", arrayOf(if (blocked) 1 else 0, id))
+        if (blocked) writableDatabase.execSQL("UPDATE messages SET read=1 WHERE chat=? AND read=0", arrayOf(id))
+        bump()
+    }
 
     fun saveContact(card: Card, status: Int) {
         val cv = ContentValues().apply {
@@ -93,7 +122,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         val existing = contact(card.id)
         if (existing != null) {
             // On ne rétrograde jamais un contact accepté ; on met à jour pseudo et clés si la carte est plus récente.
-            cv.put("status", if (existing.accepted) 1 else status); cv.put("added", existing.added); cv.put("last_seen", existing.lastSeen)
+            cv.put("status", if (existing.status == 1) 1 else status); cv.put("added", existing.added); cv.put("last_seen", existing.lastSeen)
             writableDatabase.update("contacts", cv, "id=?", arrayOf(card.id))
         } else writableDatabase.insert("contacts", null, cv)
         bump()
@@ -174,10 +203,11 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         }
         add(ALL, "Tout le monde", true)
         groups().forEach { add(it.id, it.name, true) }
-        contacts().filter { it.status != 0 }.forEach { add(it.id, it.name, false) }
+        val all = contacts()
+        all.filter { it.status != 0 && !it.blocked }.forEach { add(it.id, it.name, false) }
         // Discussions qui ont des messages reçus mais ne sont ni un groupe ni un contact (messages privés d'inconnus) :
         // sans cette ligne, elles restaient introuvables et le compteur de non-lus ne redescendait jamais.
-        val known = out.map { it.chat }.toSet()
+        val known = out.map { it.chat }.toSet() + all.filter { it.blocked }.map { it.id } // un contact bloqué reste caché
         q("SELECT chat, MAX(sender_name) FROM messages WHERE mine=0 GROUP BY chat") { it.getString(0) to (it.getString(1) ?: "") }
             .filter { it.first !in known }.forEach { (c, n) -> add(c, n.ifBlank { "Inconnu" }, false) }
         return out.sortedWith(compareByDescending<ChatSummary> { it.chat == ALL }.thenByDescending { it.last?.shownAt ?: 0L })
@@ -234,7 +264,8 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
      * au moment d'envoyer, avec [outboxData].
      */
     fun outbox(): List<Outbox> {
-        val rows = q("SELECT fid, dest, created, sent_to, mine FROM outbox ORDER BY created DESC") { readOutboxRow(it) }
+        // Les SOS d'abord, puis du plus récent au plus ancien.
+        val rows = q("SELECT fid, dest, created, sent_to, mine, type FROM outbox ORDER BY (type=10) DESC, created DESC") { readOutboxRow(it) }
         val out = ArrayList<Outbox>(rows.size)
         for (r in rows) {
             val f = java.io.File(outboxDir, r.fid + ".bin")
@@ -245,10 +276,10 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     }
     private fun readOutboxRow(c: Cursor): Outbox {
         val set = HashSet<String>(); val arr = JSONArray(c.getString(3)); for (i in 0 until arr.length()) set.add(arr.getString(i))
-        return Outbox(c.getString(0), ByteArray(0), c.getString(1), c.getLong(2), set, c.getInt(4) == 1)
+        return Outbox(c.getString(0), ByteArray(0), c.getString(1), c.getLong(2), set, c.getInt(4) == 1, 0L, c.getInt(5))
     }
     /** Une ligne de la file (sans contenu), ou null. */
-    fun outboxRow(fid: String): Outbox? = q("SELECT fid, dest, created, sent_to, mine FROM outbox WHERE fid=?", fid) { readOutboxRow(it) }.firstOrNull()
+    fun outboxRow(fid: String): Outbox? = q("SELECT fid, dest, created, sent_to, mine, type FROM outbox WHERE fid=?", fid) { readOutboxRow(it) }.firstOrNull()
     /** Le contenu d'une trame en attente, lu au moment de l'envoyer. */
     fun outboxData(fid: String): ByteArray? = try { java.io.File(outboxDir, "$fid.bin").takeIf { it.exists() }?.readBytes() } catch (e: Exception) { null }
     fun outboxCount(): Int = q("SELECT COUNT(*) FROM outbox") { it.getInt(0) }.firstOrNull() ?: 0
@@ -268,7 +299,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
     fun saveOutbox(o: Outbox) {
         java.io.File(outboxDir, o.fid + ".bin").writeBytes(o.data)
         val cv = ContentValues().apply {
-            put("fid", o.fid); put("data", ByteArray(0)); put("dest", o.dest); put("created", o.created); put("sent_to", JSONArray(o.sentTo.toList()).toString()); put("mine", if (o.mine) 1 else 0)
+            put("fid", o.fid); put("data", ByteArray(0)); put("dest", o.dest); put("created", o.created); put("sent_to", JSONArray(o.sentTo.toList()).toString()); put("mine", if (o.mine) 1 else 0); put("type", o.type)
         }
         writableDatabase.insertWithOnConflict("outbox", null, cv, SQLiteDatabase.CONFLICT_REPLACE)
     }
@@ -303,6 +334,7 @@ class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "proximo.db",
         const val ALL = "all"
         const val OUTBOX_CAP = 300L * 1024 * 1024
         const val HELD_CAP = 30L * 1024 * 1024
+        private const val CONTACT_COLS = "id, name, dh, sg, status, added, last_seen, blocked"
         /** Tri des discussions par heure d'arrivée sur ce téléphone : un message arrivé en retard se range en bas, là où on le voit. */
         private const val ARRIVAL = "CASE WHEN received>0 THEN received ELSE time END"
         @Volatile private var inst: Db? = null

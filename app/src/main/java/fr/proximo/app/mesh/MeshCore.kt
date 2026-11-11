@@ -57,6 +57,16 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     /** Dernier renvoi d'un accusé pour un message déjà reçu (pas plus d'un par minute et par message). */
     private val lastReAck = ConcurrentHashMap<String, Long>()
     private val flushQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    // ---- inventaire : à l'ouverture d'une liaison, on demande au voisin ce qu'il a déjà, pour ne pas le lui renvoyer ----
+    /** Voisins à qui on vient de demander leur inventaire : on attend leur réponse jusqu'à cette heure avant de leur envoyer les gros messages. */
+    private val invWait = ConcurrentHashMap<String, Long>()
+    /** Voisins qui n'ont pas répondu (ancienne version de Proximo) : on ne leur redemande pas. */
+    private val invSilent: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** Heure de la dernière question posée à chaque voisin (une par minute au plus), et ce qu'on lui a demandé. */
+    private val invAskedAt = ConcurrentHashMap<String, Long>()
+    private val invAsked = ConcurrentHashMap<String, Set<String>>()
+    /** Nombre de renvois d'un message privé resté sans accusé : l'attente double à chaque fois (2, 4, 8… min, 1 h au plus). */
+    private val directTries = ConcurrentHashMap<String, Int>()
     /** Trames « Wi-Fi direct seulement » (vidéos) déjà repérées : on ne relit pas leur fichier pour un voisin en Bluetooth. */
     private val wifiOnly: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
@@ -154,10 +164,14 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val p = (peerMap[peerId] ?: Peer(peerId, db.contact(peerId)?.name, System.currentTimeMillis(), false, false, 0, true)).copy(linked = true, lastSeen = System.currentTimeMillis())
         peerMap[peerId] = p
         publishPeers()
+        // La porte se ferme tout de suite pour les gros messages : la question d'inventaire part avant eux.
+        if (peerId !in invSilent) invWait[peerId] = System.currentTimeMillis() + 300 + INV_WAIT_MS
         scope.launch {
             // Liaison (r)ouverte : ce qui avait été confié à l'ancienne dans la dernière minute est redonné, par sécurité.
             lock.withLock { try { rearm(peerId) } catch (e: Exception) { Log.e(tag, "réarmement", e) } }
-            delay(300); try { onLinkUp?.invoke(p) } catch (e: Exception) { Log.e(tag, "liaison ouverte", e) }; flush()
+            delay(300)
+            try { askInventory(peerId) } catch (e: Exception) { Log.e(tag, "inventaire", e) }
+            try { onLinkUp?.invoke(p) } catch (e: Exception) { Log.e(tag, "liaison ouverte", e) }; flush()
         }
     }
 
@@ -192,6 +206,59 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         if (l.size != old.size || l.indices.any { l[it].copy(lastSeen = 0) != old[it].copy(lastSeen = 0) }) peers.value = l
     }
 
+    /**
+     * Inventaire : avant d'envoyer à ce voisin ce qui attend pour lui, on lui donne la liste des identifiants (16 octets
+     * chacun) ; il répond avec ceux qu'il a déjà, et on ne les lui renvoie pas. Rien n'est demandé s'il y a peu à envoyer.
+     * Une ancienne version ne répond pas : on attend 4 s une seule fois, puis on envoie tout comme avant.
+     */
+    private suspend fun askInventory(peerId: String) {
+        if (peerId in invSilent) { invWait.remove(peerId); return }
+        // Une question par minute et par voisin au plus (une rencontre ouvre souvent 2 ou 3 liaisons d'affilée).
+        val t = System.currentTimeMillis()
+        if (t - (invAskedAt[peerId] ?: 0L) < INV_EVERY_MS) { invWait.remove(peerId); return }
+        invAskedAt[peerId] = t
+        val fids = lock.withLock {
+            db.outbox().filter { peerId !in it.sentTo && it.size > 300 && it.type != Frame.SOS && it.type != Frame.ACK }.take(INV_MAX).map { it.fid }
+        }
+        if (fids.size < INV_MIN) { invWait.remove(peerId); return }
+        invAsked[peerId] = fids.toHashSet()
+        val payload = java.io.ByteArrayOutputStream(1 + fids.size * 16).apply { write(INV_ASK); for (f in fids) write(Hex.dec(f)) }.toByteArray()
+        val deadline = System.currentTimeMillis() + INV_WAIT_MS
+        invWait[peerId] = deadline
+        if (!sendTo(peerId, Frame(Frame.INV, 0, 0, 0, Frame.newId(), myIdBytes, Hex.dec(peerId), payload).encode())) { invWait.remove(peerId, deadline); return }
+        scope.launch {
+            delay(INV_WAIT_MS + 100)
+            // Toujours en attente de CETTE question : pas de réponse -> ancienne version, on ne lui redemandera pas.
+            if (invWait.remove(peerId, deadline)) { invSilent.add(peerId); flush() }
+        }
+    }
+
+    /** Trame d'inventaire reçue : une question (je réponds avec ce que j'ai déjà) ou une réponse (je marque « déjà chez lui »). */
+    private suspend fun onInventory(f: Frame, fromPeer: String) {
+        val p = f.payload
+        if (p.isEmpty() || (p.size - 1) % 16 != 0) return
+        val n = minOf((p.size - 1) / 16, INV_MAX)
+        val fids = (0 until n).map { Hex.enc(p.copyOfRange(1 + it * 16, 17 + it * 16)) }
+        when (p[0].toInt()) {
+            INV_ASK -> {
+                invSilent.remove(fromPeer) // il parle l'inventaire : on pourra lui poser la question aussi
+                val have = fids.filter { recentSeen.containsKey(it) || db.seen(it) }
+                val out = java.io.ByteArrayOutputStream(1 + have.size * 16).apply { write(INV_HAVE); for (h in have) write(Hex.dec(h)) }.toByteArray()
+                sendTo(fromPeer, Frame(Frame.INV, 0, 0, 0, Frame.newId(), myIdBytes, Hex.dec(fromPeer), out).encode())
+            }
+            INV_HAVE -> {
+                invSilent.remove(fromPeer)
+                // Seulement ce que j'ai demandé : une réponse non sollicitée ne peut rien faire marquer.
+                val asked = invAsked.remove(fromPeer) ?: return
+                lock.withLock {
+                    for (fid in fids) if (fid in asked) db.outboxRow(fid)?.let { o -> if (o.sentTo.add(fromPeer)) db.outboxSentTo(fid, o.sentTo) }
+                }
+                invWait.remove(fromPeer)
+                requestFlush()
+            }
+        }
+    }
+
     /** Demande un passage de la file d'attente ; les demandes en rafale n'en font qu'un. */
     private fun requestFlush() {
         if (flushQueued.compareAndSet(false, true)) scope.launch { flushQueued.set(false); flush() }
@@ -216,6 +283,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         // Une trame directe (carte, photo de profil, mise à jour…) ne peut venir que du voisin qui la remet :
         // personne ne peut l'envoyer au nom d'un autre. Seul l'appel passe par un relais.
         if (!f.relayable && f.type != Frame.CALL && f.fromHex != fromPeer) return
+        if (f.type == Frame.INV) { onInventory(f, fromPeer); return }
         val now = System.currentTimeMillis()
         if (f.relayable && !replay) {
             if (recentSeen.containsKey(fid) || db.seen(fid)) {
@@ -330,7 +398,9 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             // — sauf s'il attend encore dans la file du transport (liaison lente) : inutile de l'empiler deux fois.
             if (o.mine && isDirect && o.dest in o.sentTo && o.dest in connected && backlog(o.dest) == 0) {
                 val last = lastDirectSend[o.fid] ?: 0L
-                if (now - last > 120_000) { o.sentTo.remove(o.dest); changed = true }
+                val tries = directTries[o.fid] ?: 0
+                val wait = minOf(120_000L shl minOf(tries, 5), 3_600_000L) // 2, 4, 8, 16, 32 min puis 1 h : plus de renvoi toutes les 2 min pendant 30 jours
+                if (now - last > wait) { o.sentTo.remove(o.dest); changed = true; directTries[o.fid] = tries + 1 }
             }
             var data: ByteArray? = null
             for (p in connected) {
@@ -338,6 +408,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
                 // Frein : on ne confie pas plus de ~500 Ko d'avance à un voisin (sinon toute la file part en mémoire
                 // face à une liaison Bluetooth lente). Les petits messages passent toujours.
                 if (o.size > 4096 && backlog(p) > MAX_BACKLOG) continue
+                // Inventaire demandé à ce voisin : les gros messages attendent sa réponse (4 s au plus) ; les petits et les SOS partent.
+                if (o.size > 300 && o.type != Frame.SOS && (invWait[p] ?: 0L) > now) continue
                 if (o.size > 600 && p in refusedBig) continue
                 if (o.fid in wifiOnly && !hasWifiLink(p)) continue // vidéo : Wi-Fi direct seulement
                 val d = data ?: db.outboxData(o.fid)?.also { data = it } ?: break
@@ -356,11 +428,19 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             if (isDirect && o.dest in o.sentTo && !o.mine && inFlight[o.dest]?.containsKey(o.fid) != true) db.removeOutbox(o.fid)
         } catch (e: Exception) { Log.e(tag, "envoi ${o.fid}", e) }
         if (lastDirectSend.size > 2000) lastDirectSend.entries.removeAll { now - it.value > 3600_000 }
+        if (directTries.size > 2000) directTries.clear()
         pendingCount.value = db.outboxCount()
         pendingDetail.value = db.outboxDetail()
     }
 
     fun myId() = me.id
-    private companion object { const val MAX_BACKLOG = 512_000 }
+    private companion object {
+        const val MAX_BACKLOG = 512_000
+        const val INV_ASK = 1; const val INV_HAVE = 2
+        /** Pas d'inventaire pour moins de 4 messages à envoyer ; 200 identifiants au plus par question (3,2 Ko, passe vite en Bluetooth). */
+        const val INV_MIN = 4; const val INV_MAX = 200
+        const val INV_WAIT_MS = 4000L
+        const val INV_EVERY_MS = 60_000L
+    }
     fun myIdBytes() = myIdBytes
 }

@@ -42,7 +42,7 @@ import fr.proximo.app.core.Message
 fun ChatsScreen(onOpen: (String) -> Unit, onNewGroup: () -> Unit, onAdd: () -> Unit) {
     val chats by dbState(emptyList<ChatSummary>()) { it.chatSummaries() }
     val peers by peersState()
-    val pendingIn by dbState(0) { it.contacts().count { c -> c.status == 2 } }
+    val pendingIn by dbState(0) { it.contacts().count { c -> c.status == 2 && !c.blocked } }
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val svc by serviceState()
     var target by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<ChatSummary?>(null) }

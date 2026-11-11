@@ -208,6 +208,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     fun addFromCard(card: Card) {
         if (card.id == me.id) { event("C'est ton propre code"); return }
         val existing = db.contact(card.id)
+        if (existing?.blocked == true) { event("${existing.name} est bloqué : débloque-le dans Contacts pour l'ajouter"); return }
         if (existing?.accepted == true) { event("${card.name} est déjà dans tes contacts"); return }
         if (existing?.status == 2) { acceptContact(card.id); return }
         db.saveContact(card, 0)
@@ -235,6 +236,55 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         db.saveMessage(Message(Hex.enc(Frame.newId()), id, me.id, true, Message.SYS, "Vous êtes maintenant en contact", null, System.currentTimeMillis(), Message.DELIVERED, true, ""))
     }
     fun refuseContact(id: String) { db.deleteContact(id) }
+
+    /** Bloquer : plus rien de ce téléphone n'arrive (messages, demandes de contact, appels, wizz), sa discussion est cachée. */
+    fun blockContact(id: String) {
+        val name = db.contact(id)?.name ?: return
+        db.setBlocked(id, true)
+        try { NotificationManagerCompat.from(ctx).cancel(id.hashCode()) } catch (_: Exception) {}
+        event("$name est bloqué. Tu peux le débloquer dans Contacts.")
+    }
+    fun unblockContact(id: String) {
+        val name = db.contact(id)?.name ?: return
+        db.setBlocked(id, false)
+        // Ma demande de contact était partie avant le blocage et sa réponse a été ignorée : je la renvoie.
+        if (db.contact(id)?.status == 0) cards[id]?.let { core.send(Frame(Frame.CONTACT_REQ, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(id), me.card().toJson().toString().toByteArray())) }
+        event("$name est débloqué")
+    }
+    private fun isBlocked(id: String) = db.contact(id)?.blocked == true
+
+    /** Trace d'un appel dans la discussion (« Appel manqué », « Appel sans réponse »), avec notification si demandé. */
+    fun callNote(peerId: String, text: String, notifyUser: Boolean) {
+        scope.launch {
+            val c = db.contact(peerId)
+            if (c?.blocked == true) return@launch
+            val name = c?.name ?: cards[peerId]?.name ?: core.peer(peerId)?.name ?: "Inconnu"
+            val now = System.currentTimeMillis()
+            val showing = isShowing(peerId)
+            db.saveMessage(Message(Hex.enc(Frame.newId()), peerId, peerId, false, Message.SYS, text, null, now, Message.DELIVERED, !notifyUser || showing, "", name, now))
+            if (notifyUser && !showing) notify(name, text, peerId, false)
+        }
+    }
+
+    /** Bouton « Renvoyer » d'un message en échec : il repart comme un message neuf, l'ancien est retiré. */
+    private val resending: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    fun resend(mid: String) {
+        if (!resending.add(mid)) return // deux appuis rapprochés : un seul renvoi
+        scope.launch {
+            try {
+                val m = db.message(mid) ?: return@launch
+                if (!m.mine || m.status != Message.FAILED) return@launch
+                if (m.kind == Message.WIZZ || m.kind == Message.SOS) { event("Un ancien SOS ou wizz ne se renvoie pas : refais-le"); return@launch }
+                val blob = m.file?.let { java.io.File(it).takeIf { f -> f.exists() }?.readBytes() }
+                if (m.chat != Db.ALL && db.group(m.chat) == null && db.contact(m.chat) == null) { event("Renvoi impossible : ce contact n'existe plus"); return@launch }
+                if (m.kind in setOf(Message.PHOTO, Message.VOICE, Message.VIDEO) && blob == null) { event("Renvoi impossible : le fichier n'est plus sur ce téléphone"); return@launch }
+                if (m.kind == Message.VIDEO) sendMessageNow(m.chat, m.kind, m.body, blob, Frame.FLAG_WIFI_ONLY, 1)
+                else sendMessageNow(m.chat, m.kind, m.body, blob, 0, Frame.DEFAULT_TTL)
+                db.deleteMessage(mid)
+            } catch (e: Exception) { Log.e(tag, "renvoi", e); event("Renvoi impossible : ${e.message}") }
+            finally { resending.remove(mid) }
+        }
+    }
 
     private fun askCard(peerId: String) {
         core.send(Frame(Frame.CARD_REQ, 0, 0, 0, Frame.newId(), core.myIdBytes(), Hex.dec(peerId), ByteArray(0)))
@@ -315,7 +365,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private fun onCard(f: Frame) {
         val card = cardOf(f) ?: return
         cards[card.id] = card
-        core.replayHeld(card.id)
+        if (db.contact(card.id)?.blocked != true) core.replayHeld(card.id) // bloqué : ses messages mis de côté avant le blocage ne sont pas détruits
         db.contact(card.id)?.let { if (it.name != card.name && it.accepted) db.renameContact(card.id, card.name) }
         // Quelqu'un attendait cette carte ?
         if (wantContact.remove(card.id)) addFromCard(card)
@@ -325,8 +375,9 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private fun onContactReq(f: Frame) {
         val card = cardOf(f) ?: return
         cards[card.id] = card
-        core.replayHeld(card.id)
         val existing = db.contact(card.id)
+        if (existing?.blocked == true) return // bloqué : sa demande est ignorée, sans rien afficher
+        core.replayHeld(card.id)
         when {
             existing?.accepted == true -> { db.saveContact(card, 1); core.send(Frame(Frame.CONTACT_ACCEPT, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, me.card().toJson().toString().toByteArray())) }
             existing?.status == 0 -> { db.saveContact(card, 1); acceptContact(card.id) }   // on s'était ajoutés mutuellement
@@ -340,7 +391,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         // Une « acceptation » ne vaut que si JE lui ai demandé (demande envoyée) ou si on est déjà en contact.
         // Sans ça, n'importe quel téléphone pouvait se déclarer « accepté » tout seul.
         val existing = db.contact(card.id)
-        if (existing == null || existing.status == 2) return
+        if (existing == null || existing.status == 2 || existing.blocked) return
         db.saveContact(card, 1)
         core.replayHeld(card.id)
         if (existing.accepted) return // déjà en contact : pas de deuxième « a accepté ta demande »
@@ -350,6 +401,13 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
 
     private fun onDm(f: Frame): Boolean {
         val from = f.fromHex
+        if (isBlocked(from)) {
+            // Bloqué : le message n'est ni affiché ni gardé. Un accusé part quand même, sinon son téléphone le renverrait
+            // toutes les deux minutes pendant 30 jours (liaison et batterie occupées pour rien, des deux côtés).
+            core.send(Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, f.fid + byteArrayOf(f.hops.toByte())))
+            db.markAcked(f.fidHex)
+            return true
+        }
         val plain = Crypto.openWith(me.dhPriv, me.dhPub, f.payload, f.fid + f.from + f.to) ?: return true
         val inn = parseInner(plain) ?: return true
         val contact = db.contact(from)
@@ -406,6 +464,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val inn = parseInner(plain) ?: return true
         val from = f.fromHex
         val contact = db.contact(from)
+        if (contact?.blocked == true) return true // bloqué : ses messages de groupe ne s'affichent pas non plus
         val sigPub = contact?.sigPub ?: cards[from]?.sigPub
         if (sigPub != null && !verifyInner(f.fidHex, inn, sigPub)) return true
         store(f, gid, from, contact?.name ?: inn.json.optString("n", "Membre"), inn, inn.json.optString("k"))
@@ -418,6 +477,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val sig = f.payload.copyOfRange(f.payload.size - 64, f.payload.size)
         val inn = parseInner(inner) ?: return
         val from = f.fromHex
+        if (isBlocked(from)) return // bloqué : ni ses messages publics ni ses SOS ne s'affichent (ils restent relayés aux autres)
         val known = db.contact(from)?.sigPub ?: cards[from]?.sigPub
         if (known != null && !Crypto.verify(known, f.fid + inner, sig)) return
         val name = db.contact(from)?.name ?: inn.json.optString("n", "Inconnu")

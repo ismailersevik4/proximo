@@ -64,8 +64,9 @@ class Frame(
         const val APK = 12           // partage de mise à jour (direct uniquement)
         const val PING = 13          // mesure de présence (direct uniquement)
         const val AVATAR = 14        // ma photo de profil (direct uniquement)
+        const val INV = 15           // inventaire à l'ouverture d'une liaison : « as-tu déjà ces messages ? » (direct uniquement)
 
-        val DIRECT_ONLY = setOf(HELLO, CARD_REQ, CARD, CALL, APK, PING, AVATAR)
+        val DIRECT_ONLY = setOf(HELLO, CARD_REQ, CARD, CALL, APK, PING, AVATAR, INV)
         /** Drapeau : ne passer que par une prise Wi-Fi direct (vidéos, gros fichiers). */
         const val FLAG_WIFI_ONLY = 1
         /** Drapeau : morceau de mise à jour autorisé à passer en Bluetooth (secours, lent). */

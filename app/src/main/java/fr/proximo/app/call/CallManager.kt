@@ -86,6 +86,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         if (!micOk()) { MeshService.instance?.messenger?.event("Micro refusé : autorise-le dans les réglages Android de Proximo pour appeler"); return }
         val name = db.contact(peerId)?.name ?: core.peer(peerId)?.name ?: "Contact"
         if (contactKey(peerId) == null) { MeshService.instance?.messenger?.event("Ajoute d'abord $name en contact pour l'appeler"); return }
+        if (db.contact(peerId)?.blocked == true) { MeshService.instance?.messenger?.event("$name est bloqué : débloque-le pour l'appeler"); return }
         if (db.contact(peerId)?.accepted != true) { MeshService.instance?.messenger?.event("L'appel marchera quand $name sera dans tes contacts (demande acceptée)"); return }
         if (core.hasWifiLink(peerId)) { startOutgoing(peerId, name, null); return }
         // Pas de prise directe : on demande aux voisins Wi-Fi s'ils ont une prise avec lui.
@@ -107,7 +108,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
         state.value = CallState(CallState.RINGING_OUT, peerId, name, System.currentTimeMillis(), via = via, viaName = viaName)
         val j = JSONObject().put("c", "invite").put("salt", B64.enc(salt)).put("ks", B64.enc(mySalt)).apply { if (via != null) put("via", via) }
         sendJson(peerId, j, via)
-        handler.postDelayed({ val st = state.value; if (st.phase == CallState.RINGING_OUT && st.peerId == peerId) { hangup(); MeshService.instance?.messenger?.event("Pas de réponse") } }, 45_000)
+        handler.postDelayed({ val st = state.value; if (st.phase == CallState.RINGING_OUT && st.peerId == peerId) { hangup(); MeshService.instance?.messenger?.event("Pas de réponse"); MeshService.instance?.messenger?.callNote(peerId, "📞 Appel sans réponse", false) } }, 45_000)
     }
 
     fun accept() {
@@ -217,7 +218,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                 // Invitation sans aléa valide (ancienne version ou trame abîmée) : refusée, jamais de clé prévisible.
                 if (salt.size != 7 || peerSalt.size != 16 || contactKey(from) == null) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
                 // Seuls mes contacts peuvent faire sonner le téléphone (ou tout le monde si j'accepte les messages privés des inconnus).
-                if (db.contact(from)?.accepted != true && !fr.proximo.app.core.Settings.get(ctx).allowUnknownDm) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
+                if (db.contact(from)?.blocked == true || (db.contact(from)?.accepted != true && !fr.proximo.app.core.Settings.get(ctx).allowUnknownDm)) { sendJson(from, JSONObject().put("c", "reject"), useVia); return true }
                 sendDir = 2; seq = 0; lastRecvSeq = -1
                 key = null
                 val viaName = useVia?.let { db.contact(it)?.name ?: core.peer(it)?.name }
@@ -231,6 +232,7 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                         stopRing(); NotificationManagerCompat.from(ctx).cancel(NOTIF)
                         state.value = CallState(CallState.IDLE, "", "", 0)
                         MeshService.instance?.messenger?.event("Appel manqué de $name")
+                        MeshService.instance?.messenger?.callNote(from, "📞 Appel manqué", true)
                     }
                 }, 60_000)
             }
@@ -240,7 +242,11 @@ class CallManager(private val ctx: Context, private val core: MeshCore) {
                 if (key == null) { hangup(); MeshService.instance?.messenger?.event("Appel impossible : version incompatible") } else startAudio(s)
             }
             "reject", "busy" -> if (s.peerId == from) { endCall(); MeshService.instance?.messenger?.event(if (c == "busy") "Occupé" else "Appel refusé") }
-            "hangup" -> if (s.peerId == from) endCall()
+            "hangup" -> if (s.peerId == from) {
+                // Il a raccroché avant que je décroche : c'est un appel manqué, noté dans la discussion.
+                if (s.phase == CallState.RINGING_IN) MeshService.instance?.messenger?.callNote(from, "📞 Appel manqué", true)
+                endCall()
+            }
         }
         return true
     }

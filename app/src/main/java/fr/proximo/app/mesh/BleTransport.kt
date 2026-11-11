@@ -65,6 +65,8 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         /** Octets en attente dans la file (pour que le cœur n'empile pas toute sa file d'attente en mémoire). */
         val queued = java.util.concurrent.atomic.AtomicInteger(0)
         fun enqueue(c: ByteArray) { queue.add(c); queued.addAndGet(c.size) }
+        /** Trame prioritaire (SOS) : ses morceaux passent devant tout ce qui attend, dans leur ordre. */
+        fun enqueueFirst(chunks: List<ByteArray>) { for (c in chunks.asReversed()) { queue.addFirst(c); queued.addAndGet(c.size) } }
         fun clearQueue() { queue.clear(); queued.set(0) }
         @Volatile var writing = false
         var retries = 0
@@ -143,7 +145,9 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
 
     override fun send(peerId: String, data: ByteArray): Boolean {
         val link = links.values.firstOrNull { it.peerId == peerId && it.ready } ?: return false
-        for (c in Fragmenter.split(data, link.chunk)) link.enqueue(c)
+        val chunks = Fragmenter.split(data, link.chunk)
+        // Un SOS ne fait pas la queue derrière des photos : il part en premier.
+        if (data.size > 3 && (data[3].toInt() and 0xff) == Frame.SOS) link.enqueueFirst(chunks) else for (c in chunks) link.enqueue(c)
         pump(link)
         return true
     }

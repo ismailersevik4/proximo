@@ -125,7 +125,7 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
                     }, color = Px.Muted)
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        when { c?.accepted == true -> "Dans tes contacts"; c?.status == 0 -> "Demande envoyée, en attente"; c?.status == 2 -> "Il veut t'ajouter en contact"; else -> "Pas encore dans tes contacts" },
+                        when { c?.blocked == true -> "Bloqué : rien de lui n'arrive sur ce téléphone"; c?.accepted == true -> "Dans tes contacts"; c?.status == 0 -> "Demande envoyée, en attente"; c?.status == 2 -> "Il veut t'ajouter en contact"; else -> "Pas encore dans tes contacts" },
                         color = Px.AccentSoft,
                     )
                     if (!canCall) { Spacer(Modifier.height(6.dp)); Text("Pas d'appel possible : il faut une liaison Wi-Fi direct (avec lui, ou avec un voisin qui l'a). Le talkie-walkie marche.", color = Px.Muted, fontSize = 12.sp) }
@@ -133,6 +133,7 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
             },
             confirmButton = {
                 when {
+                    c?.blocked == true -> TextButton(onClick = { selected = null; val m = svc?.messenger; if (m != null) Thread { m.unblockContact(p.id) }.start() }) { Text("Débloquer") }
                     c?.accepted == true -> {
                         TextButton(onClick = { selected = null; onOpenChat(p.id) }) { Text("Écrire") }
                         if (canCall) TextButton(onClick = { selected = null; svc?.calls?.call(p.id) }) { Text("Appeler") }

@@ -116,6 +116,29 @@ object Locations {
         androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
             androidx.core.content.ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
+    /** Dernière position connue de ce téléphone, quel que soit son âge (sans allumer le GPS) ; null si inconnue ou non autorisée. */
+    @Suppress("MissingPermission")
+    fun lastKnown(ctx: Context): Location? {
+        if (!allowed(ctx)) return null
+        val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        return listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+            .mapNotNull { try { lm.getLastKnownLocation(it) } catch (e: Exception) { null } }.maxByOrNull { it.time }
+    }
+
+    /** « 350 m », « 2,4 km ». */
+    fun distanceText(meters: Float): String = when {
+        meters < 20 -> "moins de 20 m"
+        meters < 1000 -> "${(meters / 10).toInt() * 10} m"
+        meters < 100_000 -> "%.1f km".format(java.util.Locale.FRANCE, meters / 1000)
+        else -> "${(meters / 1000).toInt()} km"
+    }
+    /** Cap en degrés -> « nord-est ». */
+    fun compassText(bearing: Float): String {
+        val names = listOf("nord", "nord-est", "est", "sud-est", "sud", "sud-ouest", "ouest", "nord-ouest")
+        val b = ((bearing % 360) + 360) % 360
+        return names[(((b + 22.5f) / 45f).toInt()) % 8]
+    }
+
     /**
      * Position récente (moins de 2 min), sinon une vraie demande au téléphone — sur toutes les versions d'Android —
      * en attendant au plus maxWaitMs (un SOS ne doit pas rester bloqué à chercher le GPS). À défaut, la dernière connue.

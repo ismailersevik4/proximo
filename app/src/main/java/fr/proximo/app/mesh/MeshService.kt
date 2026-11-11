@@ -63,10 +63,13 @@ class MeshService : Service() {
         core.start()
         updater.startPeriodicOffers()
         // Garde le processeur éveillé pour le Bluetooth quand l'écran est éteint (les vieux téléphones coupent sinon).
+        // En « Priorité batterie » sur Android 12 et plus, il n'est gardé que lorsqu'un téléphone est à portée : seul, le téléphone peut dormir.
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
-            wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "Proximo:reseau").also { it.setReferenceCounted(false); it.acquire() }
+            wakeLock = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "Proximo:reseau").also { it.setReferenceCounted(false) }
         } catch (_: Exception) {}
+        applyWakeLock()
+        scope.launch { core.peers.collect { applyWakeLock() } }
         ContextCompat.registerReceiver(this, radioReceiver, IntentFilter().apply {
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             addAction(WifiAwareManager.ACTION_WIFI_AWARE_STATE_CHANGED)
@@ -109,7 +112,7 @@ class MeshService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
-        try { wakeLock?.release() } catch (_: Exception) {}
+        try { wakeLock?.let { if (it.isHeld) it.release() } } catch (_: Exception) {}
         try { unregisterReceiver(radioReceiver) } catch (_: Exception) {}
         // Raccrocher AVANT d'arrêter le réseau, sinon le « raccroché » ne part jamais et l'autre reste en ligne.
         if (::calls.isInitialized) try { calls.hangup() } catch (_: Exception) {}
@@ -122,7 +125,16 @@ class MeshService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    fun updateMode(mode: Int) { core.setMode(mode) }
+    fun updateMode(mode: Int) { core.setMode(mode); applyWakeLock() }
+
+    private fun applyWakeLock() {
+        val wl = wakeLock ?: return
+        try {
+            // Avant Android 12, on le garde toujours : les vieux téléphones arrêtent la recherche Bluetooth quand ils dorment.
+            val keep = Settings.get(this).mode != Modes.BATTERIE || Build.VERSION.SDK_INT < 31 || core.peers.value.isNotEmpty()
+            if (keep && !wl.isHeld) wl.acquire() else if (!keep && wl.isHeld) wl.release()
+        } catch (_: Exception) {}
+    }
 
     private fun serviceNotification(nb: Int = -1, pending: Int = 0): Notification {
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)

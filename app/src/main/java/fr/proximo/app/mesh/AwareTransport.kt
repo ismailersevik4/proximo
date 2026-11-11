@@ -141,7 +141,11 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     /** Envoi : par la prise si elle est ouverte, sinon par petits messages (si la trame est courte). */
     override fun send(peerId: String, data: ByteArray): Boolean {
         val p = peers[peerId] ?: return false
-        if (p.out != null) { p.queue.offer(data); return true }
+        if (p.out != null) {
+            // Un SOS passe devant ce qui attend dans la prise.
+            if (data.size > 3 && (data[3].toInt() and 0xff) == Frame.SOS) p.queue.offerFirst(data) else p.queue.offer(data)
+            return true
+        }
         if (data.size <= 250) {
             try {
                 val h = p.pubHandle; val s = sub
