@@ -128,6 +128,7 @@ fun RadarScreen(onOpenChat: (String) -> Unit) {
                         when { c?.blocked == true -> "Bloqué : rien de lui n'arrive sur ce téléphone"; c?.accepted == true -> "Dans tes contacts"; c?.status == 0 -> "Demande envoyée, en attente"; c?.status == 2 -> "Il veut t'ajouter en contact"; else -> "Pas encore dans tes contacts" },
                         color = Px.AccentSoft,
                     )
+                    if (p.limited) { Spacer(Modifier.height(6.dp)); Text("Ancienne version de Proximo : ce téléphone doit se mettre à jour pour échanger des messages. Le tien lui propose la mise à jour.", color = Px.Warn, fontSize = 12.sp) }
                     if (!canCall) { Spacer(Modifier.height(6.dp)); Text("Pas d'appel possible : il faut une liaison Wi-Fi direct (avec lui, ou avec un voisin qui l'a). Le talkie-walkie marche.", color = Px.Muted, fontSize = 12.sp) }
                 }
             },

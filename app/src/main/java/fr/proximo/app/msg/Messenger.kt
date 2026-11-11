@@ -55,6 +55,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         /** Côté réception : pas deux sonneries du même contact à moins de 20 s. */
         const val WIZZ_RING_GAP_MS = 20_000L
         private const val GINV = "ginv"
+        private const val CTX_ALL = "all"; private const val CTX_DM = "dm:"; private const val CTX_GROUP = "grp:"
         private val HEX16 = Regex("^[0-9a-f]{16}$")
     }
     private val tag = "ProximoMsg"
@@ -63,6 +64,8 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     private val settings = Settings.get(ctx)
     private val mediaDir = File(ctx.filesDir, "media").also { it.mkdirs() }
     private val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.CoroutineExceptionHandler { _, e -> Log.e(tag, "tâche de fond", e) })
+    /** Démarrage du réseau : tâches de fond de la messagerie (appelé une fois le service prêt). */
+    fun start() { scope.launch { try { migrateToFormat2() } catch (e: Exception) { Log.e(tag, "passage au format 2", e) } } }
     /** Arrêt du réseau : plus aucune tâche de fond de cette messagerie. */
     fun stop() { try { scope.cancel() } catch (_: Exception) {} }
 
@@ -135,10 +138,14 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val fid = Frame.newId()
         val mid = Hex.enc(fid)
         val time = System.currentTimeMillis()
-        val inner = inner(mid, kind, body, time, blob)
         // Un contact passe toujours avant un groupe : une discussion privée ne peut jamais partir vers un groupe du même identifiant.
         val contact = if (chat == Db.ALL) null else db.contact(chat) ?: cards[chat]?.let { Contact(it.id, it.name, it.dhPub, it.sigPub, 0, 0, 0) }
         val group = if (chat == Db.ALL || contact != null) null else db.group(chat)
+        // Le destinataire fait partie de ce qui est signé : « all », l'identifiant du groupe, ou celui du contact.
+        // Le type est signé aussi (« dm: », « grp: », « all ») : un identifiant de groupe ne peut pas passer pour celui d'un téléphone.
+        val ctx = when { chat == Db.ALL -> CTX_ALL; group != null -> CTX_GROUP + group.id; else -> CTX_DM + (contact?.id ?: chat) }
+        // Vers un contact accepté, ma clé n'est pas jointe (il l'a déjà) : le message reste assez court pour un petit message Wi-Fi direct.
+        val inner = inner(mid, kind, body, time, blob, ctx, attachKey = !(chat != Db.ALL && group == null && contact?.accepted == true))
         val frame: Frame? = when {
             chat == Db.ALL -> {
                 val sig = Crypto.sign(me.sigPriv, fid + inner)
@@ -162,10 +169,12 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
     }
 
     /** Payload en clair : [longueur json (2)][json][fichier]. Le json est signé par l'émetteur. */
-    private fun inner(mid: String, kind: String, body: String, time: Long, blob: ByteArray?): ByteArray {
+    private fun inner(mid: String, kind: String, body: String, time: Long, blob: ByteArray?, ctxId: String, attachKey: Boolean = true): ByteArray {
         val blobHash = Hex.enc(Crypto.sha256(blob ?: ByteArray(0)))
-        val sig = Crypto.sign(me.sigPriv, "$mid|$kind|$body|$time|$blobHash".toByteArray())
-        val json = JSONObject().put("k", kind).put("b", body).put("t", time).put("n", me.name).put("s", B64.enc(sig)).toString().toByteArray()
+        val name = me.name
+        val sig = Crypto.sign(me.sigPriv, signedV2(mid, kind, body, time, blobHash, ctxId, name))
+        // « sg » = ma clé publique : n'importe qui peut vérifier la signature (l'identifiant d'un téléphone est l'empreinte de cette clé).
+        val json = JSONObject().put("v", 2).put("k", kind).put("b", body).put("t", time).put("n", name).put("s", B64.enc(sig)).apply { if (attachKey) put("sg", B64.enc(me.sigPub)) }.toString().toByteArray()
         require(json.size <= 0xFFFF) { "message trop long" }
         val b = ByteBuffer.allocate(2 + json.size + (blob?.size ?: 0))
         b.putShort(json.size.toShort()).put(json)
@@ -182,12 +191,38 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         Inner(JSONObject(String(js)), rest)
     } catch (e: Exception) { null }
 
-    private fun verifyInner(mid: String, inn: Inner, sigPub: ByteArray?): Boolean {
+    /**
+     * Ce qui est signé (format 2) : chaque champ précédé de sa longueur, dont le DESTINATAIRE (identifiant du contact,
+     * du groupe, ou « all ») et le pseudo. Un message signé pour quelqu'un ne peut donc plus être présenté à un autre.
+     */
+    private fun signedV2(mid: String, kind: String, body: String, time: Long, blobHash: String, ctxId: String, name: String): ByteArray {
+        val bos = java.io.ByteArrayOutputStream()
+        bos.write("proximo-msg-v2".toByteArray())
+        for (s in listOf(mid, kind, body, time.toString(), blobHash, ctxId, name)) { val b = s.toByteArray(); bos.write(ByteBuffer.allocate(4).putInt(b.size).array()); bos.write(b) }
+        return bos.toByteArray()
+    }
+
+    /** ctxId = à qui le message doit être destiné pour être accepté (moi, le groupe, ou « all »). Les messages à l'ancien format sont refusés. */
+    private fun verifyInner(mid: String, inn: Inner, sigPub: ByteArray?, ctxId: String): Boolean {
         if (sigPub == null) return false
         val j = inn.json
+        if (j.optInt("v") < 2) return false
         val blobHash = Hex.enc(Crypto.sha256(inn.blob ?: ByteArray(0)))
-        val data = "$mid|${j.optString("k")}|${j.optString("b")}|${j.optLong("t")}|$blobHash".toByteArray()
-        return Crypto.verify(sigPub, data, B64.dec(j.optString("s")))
+        val data = signedV2(mid, j.optString("k"), j.optString("b"), j.optLong("t"), blobHash, ctxId, j.optString("n"))
+        return try { Crypto.verify(sigPub, data, B64.dec(j.optString("s"))) } catch (e: Exception) { false }
+    }
+
+    /**
+     * La clé de signature de l'expéditeur : celle du contact, de sa carte, ou celle jointe au message — acceptée seulement
+     * si son empreinte est bien l'identifiant de l'expéditeur. Plus aucun message n'est accepté sans vérification.
+     */
+    private fun senderKey(from: String, inn: Inner): ByteArray? {
+        db.contact(from)?.sigPub?.takeIf { it.size == 32 }?.let { return it }
+        cards[from]?.sigPub?.let { return it }
+        val sg = inn.json.optString("sg")
+        if (sg.isEmpty()) return null
+        val pub = try { B64.dec(sg) } catch (e: Exception) { return null }
+        return pub.takeIf { it.size == 32 && Identity.idOf(it) == from }
     }
 
     private fun saveBlob(mid: String, kind: String, blob: ByteArray): String {
@@ -264,6 +299,32 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
             db.saveMessage(Message(Hex.enc(Frame.newId()), peerId, peerId, false, Message.SYS, text, null, now, Message.DELIVERED, !notifyUser || showing, "", name, now))
             if (notifyUser && !showing) notify(name, text, peerId, false)
         }
+    }
+
+    /**
+     * Une seule fois, au premier démarrage de la version « preuve d'identité » : mes messages privés encore en attente
+     * étaient signés à l'ancien format, que les téléphones à jour refusent. Ils sont refaits au nouveau format,
+     * et mes groupes sont réannoncés à leurs membres.
+     */
+    private fun migrateToFormat2() {
+        if (db.kv("fmt2") != null) return
+        val broadcast = Hex.enc(Frame.BROADCAST)
+        // Du plus ancien au plus récent, pour qu'ils repartent et s'affichent dans l'ordre.
+        for (o in db.outbox().sortedBy { it.created }) {
+            if (!o.mine || o.dest == broadcast) continue
+            val m = db.message(o.fid)
+            if (m == null || !m.mine || m.status >= Message.DELIVERED) { db.removeOutbox(o.fid); continue }
+            try {
+                val blob = m.file?.let { java.io.File(it).takeIf { f -> f.exists() }?.readBytes() }
+                val lost = m.kind in setOf(Message.PHOTO, Message.VOICE, Message.VIDEO) && blob == null
+                if (m.kind == Message.WIZZ || lost || db.contact(m.chat) == null) { db.removeOutbox(o.fid); db.setStatus(m.mid, Message.FAILED); continue }
+                if (m.kind == Message.VIDEO) sendMessageNow(m.chat, m.kind, m.body, blob, Frame.FLAG_WIFI_ONLY, 1) else sendMessageNow(m.chat, m.kind, m.body, blob, 0, Frame.DEFAULT_TTL)
+                // L'ancien n'est retiré qu'une fois le nouveau enregistré.
+                db.removeOutbox(o.fid); db.deleteMessage(m.mid)
+            } catch (e: Exception) { Log.e(tag, "refonte ${m.mid}", e); db.removeOutbox(o.fid); db.setStatus(m.mid, Message.FAILED) }
+        }
+        for (g in db.groups()) if (g.owner == me.id) shareGroup(g, g.members.filter { it != me.id && db.contact(it) != null })
+        db.kv("fmt2", "1")
     }
 
     /** Bouton « Renvoyer » d'un message en échec : il repart comme un message neuf, l'ancien est retiré. */
@@ -404,16 +465,17 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         if (isBlocked(from)) {
             // Bloqué : le message n'est ni affiché ni gardé. Un accusé part quand même, sinon son téléphone le renverrait
             // toutes les deux minutes pendant 30 jours (liaison et batterie occupées pour rien, des deux côtés).
-            core.send(Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, f.fid + byteArrayOf(f.hops.toByte())))
+            core.send(core.ackFrame(f.from, f.fid, f.hops))
             db.markAcked(f.fidHex)
             return true
         }
         val plain = Crypto.openWith(me.dhPriv, me.dhPub, f.payload, f.fid + f.from + f.to) ?: return true
         val inn = parseInner(plain) ?: return true
         val contact = db.contact(from)
-        val sigPub = contact?.sigPub ?: cards[from]?.sigPub
+        val sigPub = senderKey(from, inn)
         if (sigPub == null) { Log.i(tag, "clé de $from pas encore connue : on demande sa carte, le message sera rejoué"); askCard(from); return false }
-        if (!verifyInner(f.fidHex, inn, sigPub)) { Log.w(tag, "signature invalide de $from"); return true }
+        // La signature doit dire que le message est pour MOI (un message écrit pour un autre ne passe plus).
+        if (!verifyInner(f.fidHex, inn, sigPub, CTX_DM + me.id)) { Log.w(tag, "signature invalide de $from"); return true }
         if (contact?.accepted != true && !settings.allowUnknownDm) {
             // Pas encore accepté : si sa demande est en attente, le message attend qu'on l'accepte.
             if (contact?.status == 2 || contact?.status == 0) return false
@@ -422,7 +484,7 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val kind = inn.json.optString("k")
         val senderName = contact?.name ?: inn.json.optString("n", "Inconnu")
         // Accusé de réception : repart vers l'émetteur par le réseau.
-        core.send(Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), core.myIdBytes(), f.from, f.fid + byteArrayOf(f.hops.toByte())))
+        core.send(core.ackFrame(f.from, f.fid, f.hops))
         db.markAcked(f.fidHex) // si l'expéditeur ne reçoit pas cet accusé et renvoie le message, on saura le lui redonner
         when (kind) {
             GINV -> onGroupInvite(from, inn.json.optString("b"))
@@ -465,8 +527,9 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val from = f.fromHex
         val contact = db.contact(from)
         if (contact?.blocked == true) return true // bloqué : ses messages de groupe ne s'affichent pas non plus
-        val sigPub = contact?.sigPub ?: cards[from]?.sigPub
-        if (sigPub != null && !verifyInner(f.fidHex, inn, sigPub)) return true
+        // Signature exigée, liée à CE groupe : un membre ne peut plus écrire au nom d'un autre, ni un relais changer l'expéditeur.
+        val sigPub = senderKey(from, inn) ?: return true
+        if (!verifyInner(f.fidHex, inn, sigPub, CTX_GROUP + gid)) return true
         store(f, gid, from, contact?.name ?: inn.json.optString("n", "Membre"), inn, inn.json.optString("k"))
         return true
     }
@@ -478,8 +541,13 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val inn = parseInner(inner) ?: return
         val from = f.fromHex
         if (isBlocked(from)) return // bloqué : ni ses messages publics ni ses SOS ne s'affichent (ils restent relayés aux autres)
-        val known = db.contact(from)?.sigPub ?: cards[from]?.sigPub
-        if (known != null && !Crypto.verify(known, f.fid + inner, sig)) return
+        // Signature exigée pour tout le monde, même les inconnus (leur clé est jointe au message et vérifiée contre leur identifiant) :
+        // plus de faux SOS ni de message public sous le nom d'un autre.
+        val pub = senderKey(from, inn) ?: return
+        if (!Crypto.verify(pub, f.fid + inner, sig)) return
+        // La signature intérieure (format 2, destinataire « all ») est exigée elle aussi : la signature extérieure seule
+        // n'a pas de préfixe et pouvait être fabriquée à partir d'une autre signature du même téléphone.
+        if (!verifyInner(f.fidHex, inn, pub, CTX_ALL)) return
         val name = db.contact(from)?.name ?: inn.json.optString("n", "Inconnu")
         val kind = inn.json.optString("k")
         // « Tout le monde » : tout le monde voit tout, sans limite de temps (les retardataires reçoivent ce qui attend chez les voisins).
@@ -499,6 +567,8 @@ class Messenger(private val ctx: Context, private val core: MeshCore) {
         val o = db.outboxRow(mid)
         val fromDest = (m != null && m.mine && m.chat == f.fromHex) || (o != null && o.mine && o.dest == f.fromHex)
         if (!fromDest) return
+        // … et s'il est signé par lui (sa clé est jointe, et son empreinte doit être son identifiant).
+        if (!core.ackValid(f)) return
         if (m != null) db.setStatus(mid, Message.DELIVERED, if (hops <= 1) "Reçu en direct" else "Reçu après $hops sauts")
         db.removeOutbox(mid)
     }

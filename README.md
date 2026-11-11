@@ -4,11 +4,12 @@ Messagerie Android **sans Internet** : les téléphones se parlent directement e
 
 Conçu et développé par **Ismail Ersevik**.
 
-## Ce que fait l'appli (version 1.4.0, APK 17)
+## Ce que fait l'appli (version 1.5.0, APK 18)
 
 - **Radar** : les téléphones Proximo à portée, avec distance approximative, ceux déjà en contact et les inconnus (« ? »).
 - **Contacts** : ajout depuis le radar, par QR code ou par code `PRX-XXXX-XXXX` (l'ajout se fait dès que les deux téléphones sont à portée).
 - **Messages privés chiffrés** de bout en bout (X25519 + AES-GCM, signés Ed25519), statuts « En attente → Relayé par… → Reçu ».
+- **Identité prouvée** (à partir de la 1.5.0) : à chaque liaison, les deux téléphones prouvent qui ils sont (question au hasard signée) ; tous les messages, SOS compris, sont signés de façon vérifiable par n'importe qui, la signature dit à qui le message est destiné, et les accusés « Reçu » sont signés par le destinataire. Une version plus ancienne ne peut plus échanger de messages avec une 1.5.0 : elle reçoit seulement l'offre de mise à jour.
 - **Photos** (compressées), **talkie-walkie** (vocal, lu automatiquement à l'arrivée), **position**, **SOS** prioritaire à tout le monde.
 - **Wizz** dans les discussions privées : le téléphone du contact sonne et vibre, même en silencieux (un wizz toutes les 30 s au plus ; un wizz arrivé plus de 10 min après s'affiche sans sonner).
 - **Bloquer un contact** : plus rien de lui n'arrive (messages, appels, wizz, demandes) ; déblocage depuis Contacts.

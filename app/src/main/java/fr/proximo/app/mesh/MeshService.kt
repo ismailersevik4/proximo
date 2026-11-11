@@ -47,7 +47,7 @@ class MeshService : Service() {
         val holder = object : TransportListener {
             override fun onPeerSeen(peerId: String, name: String?, transport: String, rssi: Int) = core.onPeerSeen(peerId, name, transport, rssi)
             override fun onPeerLost(peerId: String, transport: String) = core.onPeerLost(peerId, transport)
-            override fun onFrame(data: ByteArray, peerId: String, transport: String) = core.onFrame(data, peerId, transport)
+            override fun onFrame(data: ByteArray, peerId: String, transport: String, proven: Boolean) = core.onFrame(data, peerId, transport, proven)
             override fun onStatus(transport: String, enabled: Boolean, detail: String) = core.onStatus(transport, enabled, detail)
         }
         transports.add(BleTransport(this, me.id, { me.name }, holder))
@@ -59,8 +59,11 @@ class MeshService : Service() {
         core.handler = { f, from -> if (calls.handle(f, from) || updater.handle(f, from)) true else messenger.handle(f, from) }
         // Dès qu'une liaison de données est ouverte : échange des cartes (clés) et offre de mise à jour.
         core.onLinkUp = { p -> messenger.onPeerAppeared(p); updater.onPeerAppeared(p) }
+        // Ancienne version à portée (pas de preuve d'identité) : on lui propose seulement la mise à jour.
+        core.onLimited = { id -> updater.onOldPeer(id) }
         core.setMode(Settings.get(this).mode)
         core.start()
+        messenger.start()
         updater.startPeriodicOffers()
         // Garde le processeur éveillé pour le Bluetooth quand l'écran est éteint (les vieux téléphones coupent sinon).
         // En « Priorité batterie » sur Android 12 et plus, il n'est gardé que lorsqu'un téléphone est à portée : seul, le téléphone peut dormir.

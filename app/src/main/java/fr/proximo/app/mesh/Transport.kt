@@ -7,7 +7,8 @@ interface TransportListener {
     /** Un voisin n'est plus joignable par ce transport. */
     fun onPeerLost(peerId: String, transport: String)
     /** Une trame complète est arrivée d'un voisin. */
-    fun onFrame(data: ByteArray, peerId: String, transport: String)
+    /** proven = false : la trame vient d'une liaison dont le voisin n'a pas prouvé son identité (mise à jour seulement). */
+    fun onFrame(data: ByteArray, peerId: String, transport: String, proven: Boolean = true)
     /** Le transport a changé d'état (allumé/éteint/erreur) : texte court pour l'écran. */
     fun onStatus(transport: String, enabled: Boolean, detail: String)
 }
@@ -18,12 +19,16 @@ interface Transport {
     fun stop()
     /** Envoie une trame entière à un voisin connecté. Rend false si pas de liaison. */
     fun send(peerId: String, data: ByteArray): Boolean
-    /** Voisins avec qui une liaison de données est ouverte. */
+    /** Voisins avec qui une liaison de données est ouverte ET qui ont prouvé leur identité. */
     fun connectedPeers(): Set<String>
+    /** Voisins reliés mais sans preuve d'identité (ancienne version de Proximo) : seules les mises à jour passent. */
+    fun limitedPeers(): Set<String> = emptySet()
     /** Change le mode (NORMAL / PORTEE / BATTERIE). */
     fun setMode(mode: Int)
     /** Vrai si une liaison à gros débit (prise Wi-Fi) est ouverte avec ce voisin. */
     fun hasFastLink(peerId: String): Boolean = false
+    /** Vrai si une prise Wi-Fi est ouverte avec ce voisin, même sans preuve d'identité (suffit pour lui envoyer une mise à jour). */
+    fun hasUpdateLink(peerId: String): Boolean = hasFastLink(peerId)
     /** Octets déjà confiés à ce transport pour ce voisin et pas encore partis (0 = tout est parti). */
     fun backlog(peerId: String): Int = 0
 }

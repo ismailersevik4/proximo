@@ -115,6 +115,7 @@ fun ChatScreen(chat: String, onBack: (() -> Unit)?, onOpenContacts: () -> Unit) 
     val subtitle = when {
         isAll -> if (peers.isEmpty()) "Personne à portée pour l'instant" else "${peers.size} téléphone(s) à portée · messages publics"
         group != null -> "${group!!.members.size} membres · ${group!!.members.count { m -> peers.any { it.id == m } }} à portée"
+        peer != null && peer.limited -> "Ancienne version de Proximo : il doit se mettre à jour pour recevoir tes messages"
         peer != null -> if (peer.linked) "Joignable" + (peer.meters?.let { " · $it m" } ?: " · Wi-Fi direct") else "À portée · liaison en attente (téléphone en veille ?)"
         else -> "Hors de portée · les messages partiront dès que possible"
     }

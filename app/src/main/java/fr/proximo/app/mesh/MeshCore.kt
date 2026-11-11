@@ -2,6 +2,7 @@ package fr.proximo.app.mesh
 
 import android.content.Context
 import android.util.Log
+import fr.proximo.app.core.Crypto
 import fr.proximo.app.core.Db
 import fr.proximo.app.core.Hex
 import fr.proximo.app.core.Identity
@@ -26,6 +27,8 @@ data class Peer(
     val wifi: Boolean,
     val rssi: Int,
     val linked: Boolean,
+    /** Relié mais sans preuve d'identité : ancienne version de Proximo, seules les mises à jour passent. */
+    val limited: Boolean = false,
 ) {
     /** Distance approximative en mètres d'après la force du signal Bluetooth (très approximatif). */
     val meters: Int? get() = if (ble && rssi != 0) Math.pow(10.0, (-59 - rssi) / 25.0).toInt().coerceIn(1, 150) else null
@@ -106,6 +109,25 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
 
     fun peer(id: String): Peer? = peerMap[id]
     fun connectedPeerIds(): Set<String> = transports.flatMap { it.connectedPeers() }.toSet()
+    /** Voisins reliés sans preuve d'identité (ancienne version) et qui ne sont prouvés par aucun transport. */
+    fun limitedPeerIds(): Set<String> { val ok = connectedPeerIds(); return transports.flatMap { it.limitedPeers() }.filter { it !in ok }.toSet() }
+    /** Vrai si une prise Wi-Fi est ouverte avec ce voisin, même sans preuve d'identité (pour lui envoyer une mise à jour). */
+    fun hasUpdateLink(peerId: String): Boolean = transports.any { it.name == Modes.WIFI && it.hasUpdateLink(peerId) }
+
+    /** Accusé de réception signé par moi (le destinataire) : l'expéditeur vérifie qu'il vient bien de moi. */
+    fun ackFrame(to: ByteArray, fid: ByteArray, hops: Int): Frame =
+        Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), myIdBytes, to, fid + byteArrayOf(hops.toByte()) + Crypto.sign(me.sigPriv, ACK_PREFIX + fid) + me.sigPub)
+
+    /**
+     * Un accusé est-il bien signé par son expéditeur ? [fid (16)][sauts (1)][signature (64)][clé publique (32)].
+     * La clé jointe n'est acceptée que si son empreinte est l'identifiant de l'expéditeur : tout le monde peut vérifier, relais compris.
+     */
+    fun ackValid(f: Frame): Boolean {
+        val p = f.payload
+        if (f.type != Frame.ACK || p.size < 113) return false
+        val pub = p.copyOfRange(81, 113)
+        return try { Identity.idOf(pub) == f.fromHex && Crypto.verify(pub, ACK_PREFIX + p.copyOfRange(0, 16), p.copyOfRange(17, 81)) } catch (e: Exception) { false }
+    }
     /** Vrai si une prise Wi-Fi direct (gros débit) est ouverte avec ce voisin. */
     fun hasWifiLink(peerId: String): Boolean = transports.any { it.name == Modes.WIFI && it.hasFastLink(peerId) }
     /** Voisins avec une prise Wi-Fi direct ouverte. */
@@ -115,6 +137,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     override fun onPeerSeen(peerId: String, name: String?, transport: String, rssi: Int) {
         val old = peerMap[peerId]
         val linked = connectedPeerIds().contains(peerId)
+        val limited = !linked && (old?.limited == true)
         val p = Peer(
             id = peerId,
             // Le nom du contact n'est cherché dans la base qu'à la première apparition (pas à chaque annonce Bluetooth).
@@ -124,6 +147,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             wifi = (transport == Modes.WIFI) || (old?.wifi == true),
             rssi = if (transport == Modes.BLE && rssi != 0) rssi else (old?.rssi ?: 0),
             linked = linked,
+            limited = limited,
         )
         peerMap[peerId] = p
         publishPeers()
@@ -141,8 +165,10 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         status.value = status.value + (transport to TransportStatus(enabled, detail))
     }
 
-    override fun onFrame(data: ByteArray, peerId: String, transport: String) {
+    override fun onFrame(data: ByteArray, peerId: String, transport: String, proven: Boolean) {
         val f = Frame.decode(data) ?: return
+        // Liaison sans preuve d'identité : seules les mises à jour sont écoutées, et jamais au nom d'un voisin déjà prouvé ailleurs.
+        if (!proven && (f.type != Frame.APK || peerId in connectedPeerIds())) return
         scope.launch(rx) { try { receive(f, peerId) } catch (e: Exception) { Log.e(tag, "réception", e) } }
     }
 
@@ -161,7 +187,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
 
     /** Une liaison de données vient de s'ouvrir : on envoie tout de suite ce qui attend, et on prévient la messagerie. */
     fun onLinkReady(peerId: String) {
-        val p = (peerMap[peerId] ?: Peer(peerId, db.contact(peerId)?.name, System.currentTimeMillis(), false, false, 0, true)).copy(linked = true, lastSeen = System.currentTimeMillis())
+        val p = (peerMap[peerId] ?: Peer(peerId, db.contact(peerId)?.name, System.currentTimeMillis(), false, false, 0, true)).copy(linked = true, limited = false, lastSeen = System.currentTimeMillis())
         peerMap[peerId] = p
         publishPeers()
         // La porte se ferme tout de suite pour les gros messages : la question d'inventaire part avant eux.
@@ -173,6 +199,16 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             try { askInventory(peerId) } catch (e: Exception) { Log.e(tag, "inventaire", e) }
             try { onLinkUp?.invoke(p) } catch (e: Exception) { Log.e(tag, "liaison ouverte", e) }; flush()
         }
+    }
+
+    /** Prévenu quand un voisin est relié sans preuve d'identité (ancienne version) : on lui propose la mise à jour. */
+    var onLimited: ((String) -> Unit)? = null
+
+    /** Liaison ouverte avec un voisin qui n'a pas prouvé son identité : rien ne lui est envoyé, sauf l'offre de mise à jour. */
+    fun onLimitedLink(peerId: String) {
+        if (peerId in connectedPeerIds()) return
+        peerMap[peerId]?.let { if (!it.linked && !it.limited) { peerMap[peerId] = it.copy(limited = true); publishPeers() } }
+        scope.launch { delay(300); try { onLimited?.invoke(peerId) } catch (e: Exception) { Log.e(tag, "liaison limitée", e) } }
     }
 
     /**
@@ -270,7 +306,8 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val now = System.currentTimeMillis()
         val connected = connectedPeerIds()
         for (p in peerMap.values.toList()) {
-            if (p.id in connected) { peerMap[p.id] = p.copy(lastSeen = now, linked = true); continue }
+            if (p.id in connected) { peerMap[p.id] = p.copy(lastSeen = now, linked = true, limited = false); continue }
+            if (p.linked) peerMap[p.id] = p.copy(linked = false) // la liaison prouvée est tombée
             if (now - p.lastSeen > 150_000) { peerMap.remove(p.id); onPeerChange?.invoke(p, false) }
         }
         publishPeers()
@@ -283,6 +320,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         // Une trame directe (carte, photo de profil, mise à jour…) ne peut venir que du voisin qui la remet :
         // personne ne peut l'envoyer au nom d'un autre. Seul l'appel passe par un relais.
         if (!f.relayable && f.type != Frame.CALL && f.fromHex != fromPeer) return
+        if (f.type == Frame.AUTH) return // preuve d'identité : traitée par les transports
         if (f.type == Frame.INV) { onInventory(f, fromPeer); return }
         val now = System.currentTimeMillis()
         if (f.relayable && !replay) {
@@ -291,7 +329,7 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
                 // pas eu mon accusé -> je le renvoie (une fois par minute au plus, même s'il m'arrive par dix voisins).
                 if (f.type == Frame.DM && f.toHex == me.id && now - (lastReAck[fid] ?: 0L) > 60_000 && (db.acked(fid) || db.message(fid) != null)) {
                     lastReAck[fid] = now
-                    send(Frame(Frame.ACK, Frame.DEFAULT_TTL, 0, 0, Frame.newId(), myIdBytes, f.from, f.fid + byteArrayOf(f.hops.toByte())))
+                    send(ackFrame(f.from, f.fid, f.hops))
                 }
                 return
             }
@@ -313,9 +351,9 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
             if (forMe && !handled) db.saveHeld(fid, f.encode(), f.fromHex, fromPeer, if (heldSince > 0) heldSince else now)
         }
         if (replay) return
-        // Un accusé de réception vide les files d'attente des relais — seulement s'il vient bien du destinataire du message
+        // Un accusé de réception vide les files d'attente des relais — seulement s'il est signé par le destinataire du message
         // (sinon n'importe qui pouvait faire effacer un message en transit). Le mien est traité par la messagerie.
-        if (f.type == Frame.ACK && f.payload.size >= 16) {
+        if (ackValid(f)) {
             val target = Hex.enc(f.payload.copyOfRange(0, 16))
             val o = db.outboxRow(target)
             if (o != null && !o.mine && o.dest == f.fromHex) db.removeOutbox(target)
@@ -362,11 +400,12 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
         val apkBig = type == Frame.APK && data.size > 2000 && (flags and Frame.FLAG_ALLOW_BLE) == 0
         if (type == Frame.CALL || apkBig || (flags and Frame.FLAG_WIFI_ONLY) != 0) {
             val t = transports.firstOrNull { it.name == Modes.WIFI } ?: return false
-            return t.hasFastLink(peerId) && t.send(peerId, data)
+            // (Une mise à jour peut partir par une prise sans preuve d'identité : c'est ainsi qu'une ancienne version se met à jour.)
+            return (if (type == Frame.APK) t.hasUpdateLink(peerId) else t.hasFastLink(peerId)) && t.send(peerId, data)
         }
         // Wi-Fi d'abord pour les grosses trames, Bluetooth d'abord pour les petites.
         val ordered = if (data.size > 600) transports.sortedByDescending { it.name == Modes.WIFI } else transports.sortedByDescending { it.name == Modes.BLE }
-        for (t in ordered) if (t.connectedPeers().contains(peerId) && t.send(peerId, data)) return true
+        for (t in ordered) if ((type == Frame.APK || t.connectedPeers().contains(peerId)) && t.send(peerId, data)) return true
         return false
     }
 
@@ -434,8 +473,9 @@ class MeshCore(private val ctx: Context, private val transports: List<Transport>
     }
 
     fun myId() = me.id
-    private companion object {
+    companion object {
         const val MAX_BACKLOG = 512_000
+        val ACK_PREFIX = "proximo-ack-v1|".toByteArray()
         const val INV_ASK = 1; const val INV_HAVE = 2
         /** Pas d'inventaire pour moins de 4 messages à envoyer ; 200 identifiants au plus par question (3,2 Ko, passe vite en Bluetooth). */
         const val INV_MIN = 4; const val INV_MAX = 200

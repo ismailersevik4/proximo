@@ -43,6 +43,7 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
     override val name = Modes.BLE
     private val tag = "ProximoBLE"
     private val handler = Handler(Looper.getMainLooper())
+    private val auth = LinkAuth(ctx)
     private val manager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val adapter: BluetoothAdapter? get() = manager.adapter
 
@@ -60,6 +61,17 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         var serverDevice: BluetoothDevice? = null // côté serveur
         var mtu = 23
         var ready = false
+        /** Le voisin a prouvé son identité (voir LinkAuth). Sinon la liaison ne sert qu'aux mises à jour. */
+        @Volatile var authed = false
+        /** J'ai répondu à SA question : il peut me prouver à son tour. La liaison ne sert à émettre que si les deux preuves sont faites. */
+        @Volatile var answered = false
+        val usable get() = authed && answered
+        /** Ma question pour ce voisin (null tant qu'elle n'est pas partie), sa trame (toujours la même aux relances) et l'heure du dernier envoi. */
+        var nonce: ByteArray? = null
+        var challenge: ByteArray? = null
+        var lastAsk = 0L
+        var asks = 0
+        var limitedAnnounced = false
         val assembler = Fragmenter.Assembler()
         val queue = ConcurrentLinkedDeque<ByteArray>()
         /** Octets en attente dans la file (pour que le cœur n'empile pas toute sa file d'attente en mémoire). */
@@ -141,10 +153,14 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
 
     override fun backlog(peerId: String): Int = links.values.filter { it.peerId == peerId }.sumOf { it.queued.get() }
 
-    override fun connectedPeers(): Set<String> = links.values.filter { it.ready && it.peerId != null }.mapNotNull { it.peerId }.toSet()
+    override fun connectedPeers(): Set<String> = links.values.filter { it.ready && it.usable && it.peerId != null }.mapNotNull { it.peerId }.toSet()
+    override fun limitedPeers(): Set<String> { val ok = connectedPeers(); return links.values.filter { it.ready && !it.authed && it.peerId != null }.mapNotNull { it.peerId }.filter { it !in ok }.toSet() }
 
     override fun send(peerId: String, data: ByteArray): Boolean {
-        val link = links.values.firstOrNull { it.peerId == peerId && it.ready } ?: return false
+        // Liaison prouvée d'abord. Sans preuve (ancienne version), seules les trames de mise à jour partent.
+        val isApk = data.size > 3 && (data[3].toInt() and 0xff) == Frame.APK
+        val link = links.values.firstOrNull { it.peerId == peerId && it.ready && it.usable }
+            ?: (if (isApk) links.values.firstOrNull { it.peerId == peerId && it.ready } else null) ?: return false
         val chunks = Fragmenter.split(data, link.chunk)
         // Un SOS ne fait pas la queue derrière des photos : il part en premier.
         if (data.size > 3 && (data[3].toInt() and 0xff) == Frame.SOS) link.enqueueFirst(chunks) else for (c in chunks) link.enqueue(c)
@@ -209,7 +225,10 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         }
         // Le plus petit identifiant se connecte à l'autre, avec un délai croissant après des échecs.
         // (L'adresse Bluetooth d'un téléphone change toutes les 15 min environ : on ne rouvre pas une 2e liaison vers un voisin déjà relié.)
-        if (myId < peerId && links[addr] == null && links.values.none { it.peerId == peerId && it.ready }) {
+        // Une liaison non prouvée (ancienne version) ne bloque pas la connexion au vrai voisin, mais on n'en empile pas plus de deux.
+        val proven = links.values.any { it.peerId == peerId && it.ready && it.authed }
+        val unproven = links.values.count { it.peerId == peerId && !it.authed }
+        if (myId < peerId && links[addr] == null && !proven && unproven < 2) {
             val f = connectFailures[addr]
             val wait = when (f?.first ?: 0) { 0 -> 0L; 1 -> 10_000L; 2 -> 30_000L; else -> 60_000L }
             if (f == null || now - f.second > wait) connectTo(r.device, peerId)
@@ -269,8 +288,18 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
         if (link.ready) return
         link.ready = true
         sendHello(link)
+        startAuth(link)
         link.peerId?.let { listener.onPeerSeen(it, null, name, link.rssi) }
-        link.peerId?.let { MeshService.instance?.core?.onLinkReady(it) }
+        // (La liaison n'est annoncée au cœur qu'une fois l'identité du voisin prouvée : voir incoming.)
+    }
+
+    /** Envoie ma question d'identité sur cette liaison (une seule fois). */
+    private fun startAuth(link: Link) {
+        if (link.nonce != null) return
+        val n = auth.newNonce(); link.nonce = n
+        val ch = auth.challenge(n); link.challenge = ch; link.lastAsk = System.currentTimeMillis()
+        for (c in Fragmenter.split(ch, link.chunk)) link.enqueue(c)
+        pump(link)
     }
 
     /** Battement de cœur : permet de voir en 30 s qu'un voisin s'est endormi (Samsung…) au lieu d'attendre 90 s. */
@@ -331,7 +360,7 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
             val link = links.getOrPut(device.address) { Link(device.address).also { it.serverDevice = device } }
             link.serverDevice = device
-            if (!link.ready) { link.ready = true; sendHello(link); link.peerId?.let { listener.onPeerSeen(it, null, name, link.rssi); MeshService.instance?.core?.onLinkReady(it) } }
+            if (!link.ready) { link.ready = true; sendHello(link); startAuth(link); link.peerId?.let { listener.onPeerSeen(it, null, name, link.rssi) } }
         }
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
             links[device.address]?.let { synchronized(it) { it.writing = false }; pump(it) }
@@ -388,16 +417,46 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
             return
         }
         if (f.type == Frame.HELLO) {
-            val wasIdentified = link.peerId != null && link.ready
-            link.peerId = f.fromHex
-            idByAddress[address] = f.fromHex
+            // Identité déjà prouvée : un HELLO ne peut plus la changer (seul le pseudo est mis à jour).
+            if (link.authed) { if (f.fromHex == link.peerId) listener.onPeerSeen(f.fromHex, String(f.payload), name, link.rssi); return }
+            // Pas encore prouvée : l'identifiant annoncé est noté, et la preuve est demandée.
+            val claimed = f.fromHex
+            link.peerId = claimed
             link.ready = true
-            if (!wasIdentified) MeshService.instance?.core?.onLinkReady(f.fromHex)
-            listener.onPeerSeen(f.fromHex, String(f.payload), name, link.rssi)
+            startAuth(link)
+            // (Le pseudo d'un voisin déjà prouvé ailleurs n'est pas changé par une liaison qui ne l'a pas prouvé.)
+            listener.onPeerSeen(claimed, if (links.values.any { it.peerId == claimed && it.authed }) null else String(f.payload), name, link.rssi)
+            // Toujours pas de preuve 6 s plus tard : c'est une ancienne version, on lui propose seulement la mise à jour.
+            handler.postDelayed({
+                if (links[address] === link && link.ready && !link.authed && !link.limitedAnnounced && link.peerId == claimed) {
+                    link.limitedAnnounced = true
+                    MeshService.instance?.core?.onLimitedLink(claimed)
+                }
+            }, 6000)
             return
         }
-        val pid = link.peerId ?: idByAddress[address] ?: return
-        listener.onFrame(full, pid, name)
+        if (f.type == Frame.AUTH) {
+            if (auth.isChallenge(f)) {
+                // Ma réponse passe devant tout le reste : elle doit arriver avant mes premiers messages.
+                auth.answer(f)?.let { a ->
+                    link.enqueueFirst(Fragmenter.split(a, link.chunk)); pump(link)
+                    if (!link.answered) { link.answered = true; if (link.authed) link.peerId?.let { MeshService.instance?.core?.onLinkReady(it) } }
+                }
+            } else if (auth.isAnswer(f) && !link.authed) {
+                val id = auth.verify(f, link.nonce)
+                if (id == null) { Log.w(tag, "preuve d'identité fausse : liaison coupée"); dropLink(link); return }
+                link.peerId = id; link.authed = true
+                idByAddress[address] = id
+                listener.onPeerSeen(id, null, name, link.rssi)
+                // La liaison n'est ouverte aux messages que lorsque les deux côtés se sont prouvés.
+                if (link.answered) MeshService.instance?.core?.onLinkReady(id)
+            }
+            return
+        }
+        // Sans preuve d'identité, seules les trames de mise à jour sont écoutées.
+        if (!link.authed && f.type != Frame.APK) return
+        val pid = link.peerId ?: return
+        listener.onFrame(full, pid, name, link.authed)
     }
 
     private val txLock = Any()
@@ -410,6 +469,9 @@ class BleTransport(private val ctx: Context, private val myId: String, private v
                 // Liaison ouverte mais muette depuis 45 s malgré les pings : le voisin dort ou est parti.
                 if (l.ready && now - l.lastRx > 45_000) { Log.i(tag, "liaison muette avec ${l.peerId} : coupée"); dropLink(l); continue }
                 if (l.ready && now - l.lastPing > 15_000) { l.lastPing = now; sendPing(l, pong = false) }
+                // Preuve d'identité toujours pas reçue (question perdue ?) : on la repose.
+                // (La même trame à chaque fois ; toutes les 15 s trois fois, puis une fois par minute pour une ancienne version qui ne répondra pas.)
+                if (l.ready && !l.authed && now - l.lastAsk > (if (l.asks >= 3) 60_000 else 14_000)) l.challenge?.let { ch -> l.lastAsk = now; l.asks++; for (c in Fragmenter.split(ch, l.chunk)) l.enqueue(c); pump(l) }
                 // Voisins plus annoncés depuis 90 s : on coupe la liaison.
                 val adv = seenAdv[l.address] ?: l.lastSeen
                 if (now - maxOf(adv, l.lastSeen) > 90_000) dropLink(l)

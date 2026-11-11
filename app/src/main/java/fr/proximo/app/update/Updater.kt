@@ -194,6 +194,8 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     // ---------------- de téléphone à téléphone ----------------
     /** Dès qu'une liaison s'ouvre, on dit au voisin quelle version on a (il demandera l'APK s'il est en retard). */
     fun onPeerAppeared(p: Peer) { offerTo(p.id, force = true) }
+    /** Ancienne version de Proximo à portée : elle ne peut plus échanger de messages, on lui propose la mise à jour. */
+    fun onOldPeer(peerId: String) { offerTo(peerId, force = true) }
 
     private fun offerTo(peerId: String, force: Boolean) {
         if (!settings.shareUpdates) return
@@ -205,7 +207,7 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
 
     /** Toutes les 10 minutes, on rappelle notre version aux voisins connectés (au cas où l'offre à l'ouverture se soit perdue). */
     fun startPeriodicOffers() = scope.launch {
-        while (true) { delay(60_000); for (id in core.connectedPeerIds()) offerTo(id, force = false) }
+        while (true) { delay(60_000); for (id in core.connectedPeerIds() + core.limitedPeerIds()) offerTo(id, force = false) }
     }
 
     /** Bouton « Chercher une mise à jour chez les voisins » : on interroge tout le monde ; les réponses arrivent en « offer ». */
@@ -286,7 +288,7 @@ class Updater(private val ctx: Context, private val core: MeshCore) {
     /** Envoi de mon APK, morceau par morceau, en attendant l'accusé du voisin pour chacun (les textes passent entre deux). */
     private fun sendApk(peerId: String, ble: Boolean, have: Set<Int>) = scope.launch {
         if (sendingTo != null) { Log.i(tag, "un envoi est déjà en cours"); return@launch }
-        if (!ble && !core.hasWifiLink(peerId)) { Log.i(tag, "APK : pas de prise Wi-Fi avec $peerId"); return@launch }
+        if (!ble && !core.hasUpdateLink(peerId)) { Log.i(tag, "APK : pas de prise Wi-Fi avec $peerId"); return@launch }
         sendingTo = peerId
         val who = core.peer(peerId)?.name ?: "un voisin"
         try {

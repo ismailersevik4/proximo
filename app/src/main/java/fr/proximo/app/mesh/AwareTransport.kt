@@ -47,6 +47,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     override val name = Modes.WIFI
     private val tag = "ProximoWiFi"
     private val handler = Handler(Looper.getMainLooper())
+    private val auth = LinkAuth(ctx)
     private val exec = Executors.newCachedThreadPool()
     private val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
     private val mgr: WifiAwareManager? = if (ctx.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_AWARE)) ctx.getSystemService(Context.WIFI_AWARE_SERVICE) as? WifiAwareManager else null
@@ -76,6 +77,20 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         var connecting = false
         val assembler = Fragmenter.Assembler()
         @Volatile var dialing = false
+        /** La prise ouverte a prouvé l'identité du voisin (sinon elle ne sert qu'aux mises à jour). */
+        @Volatile var sockAuthed = false
+        /** Poignées (petits messages Wi-Fi direct) qui ont prouvé cette identité, mes questions en cours et leur heure. */
+        val authedHandles: MutableSet<PeerHandle> = ConcurrentHashMap.newKeySet()
+        val nonces = ConcurrentHashMap<PeerHandle, ByteArray>()
+        val challenges = ConcurrentHashMap<PeerHandle, ByteArray>()
+        val askedAt = ConcurrentHashMap<PeerHandle, Long>()
+        /** Poignées à qui j'ai répondu : le voisin a pu me prouver à son tour. */
+        val answeredHandles: MutableSet<PeerHandle> = ConcurrentHashMap.newKeySet()
+        var limitedAnnounced = false
+        /** Il a prouvé son identité sur cette poignée : j'écoute ce qui en vient. */
+        fun proven(h: PeerHandle?) = h != null && h in authedHandles
+        /** Les deux preuves sont faites sur cette poignée : je peux y envoyer mes messages. */
+        fun usable(h: PeerHandle?) = h != null && h in authedHandles && h in answeredHandles
     }
     private val peers = ConcurrentHashMap<String, Peer>()
     /** Numéros des petits messages, communs à tous les voisins : on sait ainsi lequel a échoué. */
@@ -132,25 +147,34 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
 
     override fun setMode(mode: Int) { this.mode = mode }
 
-    override fun hasFastLink(peerId: String): Boolean = peers[peerId]?.out != null
+    override fun hasFastLink(peerId: String): Boolean = peers[peerId]?.let { it.out != null && it.sockAuthed } == true
+    override fun hasUpdateLink(peerId: String): Boolean = peers[peerId]?.out != null
 
     override fun backlog(peerId: String): Int { val p = peers[peerId] ?: return 0; return if (p.out == null) 0 else p.queue.sumOf { it.size } }
 
-    override fun connectedPeers(): Set<String> = peers.values.filter { it.out != null || it.pubHandle != null || it.subHandle != null }.map { it.id }.toSet()
+    private fun isProven(p: Peer) = (p.out != null && p.sockAuthed) || p.usable(p.pubHandle) || p.usable(p.subHandle)
+    /** Annonce la liaison au cœur, une seule fois, dès qu'elle peut servir dans les deux sens. */
+    private fun announceIfReady(p: Peer) { if (!p.announced && isProven(p)) { p.announced = true; MeshService.instance?.core?.onLinkReady(p.id) } }
+    /** Mes réponses d'identité parties par petit message : numéro -> (voisin, poignée), pour savoir si l'une n'est pas arrivée. */
+    private val answerMsgs = ConcurrentHashMap<Int, Pair<Peer, PeerHandle>>()
+    override fun connectedPeers(): Set<String> = peers.values.filter { isProven(it) }.map { it.id }.toSet()
+    override fun limitedPeers(): Set<String> = peers.values.filter { !isProven(it) && (it.out != null || it.pubHandle != null || it.subHandle != null) }.map { it.id }.toSet()
 
     /** Envoi : par la prise si elle est ouverte, sinon par petits messages (si la trame est courte). */
     override fun send(peerId: String, data: ByteArray): Boolean {
         val p = peers[peerId] ?: return false
-        if (p.out != null) {
+        // Sans preuve d'identité (ancienne version), seules les trames de mise à jour partent.
+        val isApk = data.size > 3 && (data[3].toInt() and 0xff) == Frame.APK
+        if (p.out != null && (p.sockAuthed || isApk)) {
             // Un SOS passe devant ce qui attend dans la prise.
             if (data.size > 3 && (data[3].toInt() and 0xff) == Frame.SOS) p.queue.offerFirst(data) else p.queue.offer(data)
             return true
         }
         if (data.size <= 250) {
             try {
-                val h = p.pubHandle; val s = sub
+                val h = p.pubHandle?.takeIf { isApk || p.usable(it) }; val s = sub
                 if (h != null && s != null) { s.sendMessage(h, track(p, data), data); return true }
-                val h2 = p.subHandle; val pb = pub
+                val h2 = p.subHandle?.takeIf { isApk || p.usable(it) }; val pb = pub
                 if (h2 != null && pb != null) { pb.sendMessage(h2, track(p, data), data); return true }
             } catch (e: Exception) { Log.w(tag, "petit message", e) }
             return false
@@ -167,7 +191,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             override fun onPublishStarted(s: PublishDiscoverySession) { pub = s }
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { onMsg(peerHandle, message, fromPublish = true) }
             override fun onMessageSendFailed(messageId: Int) { onSendFailed(messageId) }
-            override fun onMessageSendSucceeded(messageId: Int) { sentMsgs.remove(messageId) }
+            override fun onMessageSendSucceeded(messageId: Int) { sentMsgs.remove(messageId); answerMsgs.remove(messageId) }
             override fun onSessionTerminated() { pub = null; if (running) handler.postDelayed({ publish() }, 3000) }
         }, handler)
     }
@@ -182,15 +206,20 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                 val id = Hex.enc(i.copyOfRange(0, 8)); if (id == myId) return
                 val nm = if (i.size > 8) String(i.copyOfRange(8, i.size)) else null
                 val p = peers.getOrPut(id) { Peer(id) }
-                p.pubHandle = peerHandle; p.lastSeen = System.currentTimeMillis(); if (nm != null) p.name = nm
+                p.lastSeen = System.currentTimeMillis()
+                // Une poignée qui a prouvé cette identité n'est jamais remplacée par une autre qui ne l'a pas prouvée.
+                if (p.pubHandle == null || p.proven(peerHandle) || !p.proven(p.pubHandle)) p.pubHandle = peerHandle
+                if (nm != null && (p.name == null || p.proven(peerHandle))) p.name = nm
                 listener.onPeerSeen(id, nm, name, 0)
-                // Je me signale à lui (il ne me voit peut-être pas encore) et je demande la voie de données si je suis le plus petit.
+                // Je me signale à lui (il ne me voit peut-être pas encore), je lui demande de prouver son identité,
+                // et je demande la voie de données si je suis le plus petit.
                 try { sub?.sendMessage(peerHandle, nextMsgId(), hello()) } catch (e: Exception) { Log.w(tag, "hello", e) }
+                if (!p.proven(peerHandle)) askProof(p, peerHandle, fromPublish = false)
                 if (myId < id) requestDataPath(p)
             }
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) { onMsg(peerHandle, message, fromPublish = false) }
             override fun onMessageSendFailed(messageId: Int) { onSendFailed(messageId) }
-            override fun onMessageSendSucceeded(messageId: Int) { sentMsgs.remove(messageId) }
+            override fun onMessageSendSucceeded(messageId: Int) { sentMsgs.remove(messageId); answerMsgs.remove(messageId) }
             override fun onSessionTerminated() { sub = null; if (running) handler.postDelayed({ subscribe() }, 3000) }
         }, handler)
     }
@@ -201,26 +230,86 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
         return Hex.dec(myId) + n.toByteArray()
     }
     /** Un petit message n'est pas passé : seule cette trame est remise en attente pour ce voisin (plus toute la file de tous les voisins). */
-    private fun onSendFailed(messageId: Int) { sentMsgs.remove(messageId)?.let { (peer, fid) -> MeshService.instance?.core?.onFrameFailed(peer, fid) } }
+    private fun onSendFailed(messageId: Int) {
+        sentMsgs.remove(messageId)?.let { (peer, fid) -> MeshService.instance?.core?.onFrameFailed(peer, fid) }
+        // Ma réponse d'identité n'est pas arrivée : cette poignée ne sert plus à émettre tant qu'il ne m'a pas requestionné.
+        answerMsgs.remove(messageId)?.let { (p, h) -> p.answeredHandles.remove(h) }
+    }
 
     private fun hello(): ByteArray = Frame(Frame.HELLO, 0, 0, 0, Frame.newId(), Hex.dec(myId), Frame.BROADCAST, myName().toByteArray()).encode()
 
     private fun onMsg(peerHandle: PeerHandle, message: ByteArray, fromPublish: Boolean) {
         val f = Frame.decode(message) ?: return
+        // Tout sauf HELLO et preuve d'identité : le voisin est celui qui a prouvé CETTE poignée, pas l'expéditeur d'origine
+        // de la trame (une trame relayée porte l'identifiant de celui qui l'a écrite, pas de celui qui la remet).
+        if (f.type != Frame.HELLO && f.type != Frame.AUTH) {
+            val owner = peers.values.firstOrNull { it.proven(peerHandle) }
+            if (owner != null) { owner.lastSeen = System.currentTimeMillis(); listener.onFrame(message, owner.id, name, true) }
+            // Poignée sans preuve (ancienne version) : seules les mises à jour sont écoutées, au nom annoncé.
+            else if (f.type == Frame.APK && f.fromHex != myId) listener.onFrame(message, f.fromHex, name, false)
+            return
+        }
         val id = f.fromHex
         if (id == myId) return
         val p = peers.getOrPut(id) { Peer(id) }
         p.lastSeen = System.currentTimeMillis()
-        if (fromPublish) p.subHandle = peerHandle else p.pubHandle = peerHandle
+        val proven = p.proven(peerHandle)
+        // Une poignée qui a prouvé cette identité n'est jamais remplacée par une autre qui ne l'a pas prouvée.
+        val current = if (fromPublish) p.subHandle else p.pubHandle
+        if (current == null || proven || !p.proven(current)) { if (fromPublish) p.subHandle = peerHandle else p.pubHandle = peerHandle }
         if (f.type == Frame.HELLO) {
-            p.name = String(f.payload)
+            if (proven || p.authedHandles.isEmpty()) p.name = String(f.payload)
             listener.onPeerSeen(id, p.name, name, 0)
             // L'éditeur (plus grand identifiant) prépare la voie de données dès qu'un abonné se signale.
             if (fromPublish && myId > id && p.out == null) acceptDataPath(p)
-            if (!p.announced) { p.announced = true; MeshService.instance?.core?.onLinkReady(id) }
+            if (!proven) {
+                askProof(p, peerHandle, fromPublish)
+                // Toujours aucune preuve 6 s plus tard : ancienne version, on lui propose seulement la mise à jour.
+                if (!p.limitedAnnounced) handler.postDelayed({
+                    if (running && peers[id] === p && !isProven(p) && !p.limitedAnnounced) { p.limitedAnnounced = true; MeshService.instance?.core?.onLimitedLink(id) }
+                }, 6000)
+            }
             return
         }
-        listener.onFrame(message, id, name)
+        if (f.type == Frame.AUTH) {
+            if (auth.isChallenge(f)) {
+                auth.answer(f)?.let { a ->
+                    val mid = nextMsgId()
+                    answerMsgs[mid] = p to peerHandle
+                    if (answerMsgs.size > 200) answerMsgs.clear()
+                    try { if (fromPublish) pub?.sendMessage(peerHandle, mid, a) else sub?.sendMessage(peerHandle, mid, a) } catch (e: Exception) { Log.w(tag, "preuve", e) }
+                    p.answeredHandles.add(peerHandle)
+                    announceIfReady(p)
+                }
+                // Il me questionne : je le (re)questionne aussi, même déjà prouvé — sa poignée a pu changer de son côté seulement
+                // (askProof se limite à une question toutes les 8 s).
+                askProof(p, peerHandle, fromPublish)
+            } else if (auth.isAnswer(f) && !proven) {
+                if (auth.verify(f, p.nonces[peerHandle]) == id) {
+                    p.authedHandles.add(peerHandle)
+                    if (fromPublish) p.subHandle = peerHandle else p.pubHandle = peerHandle
+                    announceIfReady(p)
+                } else Log.w(tag, "preuve d'identité fausse pour $id")
+            }
+            return
+        }
+        // Sans preuve d'identité, seules les trames de mise à jour sont écoutées.
+        if (!proven && f.type != Frame.APK) return
+        listener.onFrame(message, id, name, proven)
+    }
+
+    /** Envoie ma question d'identité à cette poignée (au plus une fois toutes les 8 s). */
+    private fun askProof(p: Peer, h: PeerHandle, fromPublish: Boolean) {
+        val now = System.currentTimeMillis()
+        if (now - (p.askedAt[h] ?: 0L) < 8000) return
+        p.askedAt[h] = now
+        if (p.nonces.size > 50) { p.nonces.clear(); p.challenges.clear(); p.askedAt.clear() }
+        // La même trame à chaque relance (une ancienne version, qui l'ignore, ne la note qu'une fois).
+        val ch = p.challenges.getOrPut(h) { auth.challenge(p.nonces.getOrPut(h) { auth.newNonce() }) }
+        sendRaw(h, fromPublish, ch)
+    }
+    private fun sendRaw(h: PeerHandle, fromPublish: Boolean, data: ByteArray) {
+        try { if (fromPublish) pub?.sendMessage(h, nextMsgId(), data) else sub?.sendMessage(h, nextMsgId(), data) } catch (e: Exception) { Log.w(tag, "preuve", e) }
     }
 
     // ---------------- voie de données (prise TCP) ----------------
@@ -315,21 +404,61 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
             sock.tcpNoDelay = true
             val out = DataOutputStream(sock.getOutputStream())
             val inp = DataInputStream(sock.getInputStream())
+            val nonce = auth.newNonce()
             writeFrame(out, hello())
+            writeFrame(out, auth.challenge(nonce)) // ma question d'identité, tout de suite après mon HELLO
             // Une prise qui ne se présente pas dans les 10 s est fermée (elle ne doit pas rester ouverte indéfiniment).
             sock.soTimeout = 10_000
             val first = readFrame(inp) ?: return
-            sock.soTimeout = 0
             val f = Frame.decode(first) ?: return
             if (f.type != Frame.HELLO) return
             val id = f.fromHex
+            if (id == myId) return
+            // Preuve d'identité : je réponds à sa question, j'attends sa réponse à la mienne.
+            // Une ancienne version ne connaît pas ces trames : elle parle tout de suite d'autre chose -> prise « limitée ».
+            var authed = false
+            var early: ByteArray? = null
+            var turns = 0
+            sock.soTimeout = 5_000
+            while (!authed) {
+                val d = readFrameOrSilent(inp) ?: return
+                if (d === SILENT) break     // rien en 5 s : ancienne version qui n'a rien à dire sur cette prise -> prise limitée
+                if (++turns > 8) return     // un voisin qui ne fait que poser des questions n'obtient pas une signature à l'infini
+                val g = Frame.decode(d) ?: return
+                if (g.type != Frame.AUTH) { early = d; break }
+                if (auth.isChallenge(g)) auth.answer(g)?.let { synchronized(out) { writeFrame(out, it) } }
+                else if (auth.isAnswer(g)) { if (auth.verify(g, nonce) == id) authed = true else { Log.w(tag, "preuve d'identité fausse pour $id"); return } }
+            }
+            // Une prise limitée qui reste 15 min sans rien dire est fermée (elle ne doit pas occuper la place du vrai voisin).
+            sock.soTimeout = if (authed) 0 else 900_000
             val p = peers.getOrPut(id) { Peer(id) }
-            p.name = String(f.payload)
+            // Une prise sans preuve ne remplace jamais une prise déjà ouverte avec ce voisin.
+            if (!authed && p.socket != null) return
+            if (authed || p.authedHandles.isEmpty()) p.name = String(f.payload)
             closeSocket(p)
-            p.socket = sock; p.out = out; p.connecting = false; p.failures = 0; p.nextTry = 0L
+            p.socket = sock; p.out = out; p.sockAuthed = authed; p.connecting = false; p.failures = 0; p.nextTry = 0L
             peer = p
             listener.onPeerSeen(id, p.name, name, 0)
-            MeshService.instance?.core?.onLinkReady(id)
+            if (authed) MeshService.instance?.core?.onLinkReady(id)
+            else if (!p.limitedAnnounced) { p.limitedAnnounced = true; MeshService.instance?.core?.onLimitedLink(id) }
+            /** Une trame arrivée par la prise : les questions d'identité sont traitées ici, le reste monte au cœur. */
+            fun deliver(data: ByteArray) {
+                p.lastSeen = System.currentTimeMillis()
+                val type = if (data.size > 3) data[3].toInt() and 0xff else 0
+                if (type == Frame.AUTH) {
+                    val g = Frame.decode(data) ?: return
+                    if (auth.isChallenge(g)) auth.answer(g)?.let { a -> synchronized(out) { writeFrame(out, a) } }
+                    else if (!authed && auth.isAnswer(g) && auth.verify(g, nonce) == id && p.socket === sock) {
+                        // Preuve arrivée en retard (voisin lent) : la prise limitée devient une prise normale.
+                        authed = true; p.sockAuthed = true
+                        try { sock.soTimeout = 0 } catch (_: Exception) {}
+                        MeshService.instance?.core?.onLinkReady(id)
+                    }
+                    return
+                }
+                if (!authed && type != Frame.APK) return // sans preuve, seules les mises à jour sont écoutées
+                listener.onFrame(data, id, name, authed)
+            }
             exec.execute {
                 var pending: ByteArray? = null
                 try {
@@ -342,16 +471,27 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                     }
                 } catch (_: Exception) { pending?.let { p.queue.offerFirst(it) } }
             }
+            early?.let { deliver(it) }
             while (true) {
                 val data = readFrame(inp) ?: break
-                p.lastSeen = System.currentTimeMillis()
-                listener.onFrame(data, id, name)
+                deliver(data)
             }
         } catch (e: Exception) { Log.i(tag, "prise fermée : ${e.message}") }
         finally {
             try { sock.close() } catch (_: Exception) {}
             peer?.let { if (it.socket === sock) { closeSocket(it); if (running && peers[it.id] === it) scheduleRetry(it) } }
         }
+    }
+
+    /** Comme readFrame, mais rend SILENT si rien n'arrive avant le délai de la prise (rien n'est consommé). */
+    private fun readFrameOrSilent(inp: DataInputStream): ByteArray? {
+        val b0 = try { inp.read() } catch (e: java.net.SocketTimeoutException) { return SILENT } catch (e: Exception) { return null }
+        if (b0 < 0) return null
+        val len = try { (b0 shl 24) or (inp.readUnsignedByte() shl 16) or (inp.readUnsignedByte() shl 8) or inp.readUnsignedByte() } catch (e: Exception) { return null }
+        if (len <= 0 || len > Frame.HEADER + Frame.MAX_PAYLOAD) return null
+        val buf = ByteArray(len)
+        try { inp.readFully(buf) } catch (e: Exception) { return null }
+        return buf
     }
 
     private fun writeFrame(out: DataOutputStream, data: ByteArray) { out.writeInt(data.size); out.write(data); out.flush() }
@@ -367,7 +507,7 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     private fun closeSocket(p: Peer) {
         val had = p.socket != null
         try { p.socket?.close() } catch (_: Exception) {}
-        p.socket = null; p.out = null
+        p.socket = null; p.out = null; p.sockAuthed = false
         // Ce qui attendait dans cette prise sera renvoyé par le cœur : on ne le garde pas en double pour la prochaine.
         p.queue.clear()
         if (had) { MeshService.instance?.core?.onDeliveryFailed(p.id); listener.onPeerSeen(p.id, p.name, name, 0) }
@@ -385,7 +525,13 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
                 if (p.out != null) { p.lastSeen = now; listener.onPeerSeen(p.id, p.name, name, 0); continue }
                 if (now - p.lastSeen > 180_000) { closePeer(p); peers.remove(p.id); listener.onPeerLost(p.id, name); continue }
                 // Sans prise, on se signale pour rester visibles l'un pour l'autre (le HELLO reçu rafraîchit lastSeen chez l'autre).
-                try { p.pubHandle?.let { h -> sub?.sendMessage(h, nextMsgId(), hello()) } ?: p.subHandle?.let { h -> pub?.sendMessage(h, nextMsgId(), hello()) } } catch (_: Exception) {}
+                try {
+                    val ph = p.pubHandle; val sh = p.subHandle
+                    if (ph != null) sub?.sendMessage(ph, nextMsgId(), hello()) else if (sh != null) pub?.sendMessage(sh, nextMsgId(), hello())
+                    // Preuve incomplète (question ou réponse perdue, poignée changée d'un seul côté) : on repose la question.
+                    if (ph != null && !p.usable(ph)) askProof(p, ph, fromPublish = false)
+                    if (sh != null && !p.usable(sh)) askProof(p, sh, fromPublish = true)
+                } catch (_: Exception) {}
             }
             // Le pseudo a changé : on republie.
             val i = info()
@@ -397,5 +543,6 @@ class AwareTransport(private val ctx: Context, private val myId: String, private
     companion object {
         const val SERVICE = "proximo"
         const val PSK = "proximo-maillage-2026"
+        private val SILENT = ByteArray(0)
     }
 }
